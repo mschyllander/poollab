@@ -2,16 +2,24 @@
    MIT License.
 
    BLE-YC01 Pool Logger Gateway for ESP32
-   Mr Matzos PoolLab firmware v1.1.30-OTA-FIX
+   Mr Matzos PoolLab firmware v1.1.34-HTTPOTA-FILTER
 
-   Fixes in this build:
-   - Coexistence fix: WiFi modem sleep ON while BLE is active; disable only during OTA after BLE stop.
-   - /ota now uses the same hardened OTA maintenance path as serial command OTA.
-   - BLE is disconnected and BLE stack is deinitialized before OTA maintenance.
-   - OTA maintenance loop avoids BLE, battery scan, HTTP measurement POST and long blocking work.
-   - Adds /reboot route.
-   - Keeps firmware upload OTA only. Do not use uploadfsota unless you have a data/ folder.
-   - Keeps TEMP_PAIR_INDEX mapping and decoded pair debug.
+   Changes in this build:
+   - Removes ArduinoOTA / PlatformIO OTA completely.
+   - Adds pull-based HTTP OTA via /httpota.
+   - ESP32 downloads firmware directly from NAS/web server:
+       http://192.168.1.184:8010/update/poolsniffer.bin
+   - This avoids Windows firewall, host_ip, callback-port and PlatformIO OTA handshake problems.
+   - Stops BLE cleanly before firmware update.
+   - Keeps WiFi modem sleep ON while BLE is active.
+   - Adds decodedLen debug in serial and /pairs.
+   - Keeps safer pH filtering and chlorine smoothing.
+   - Fixes ORP mapping using decoded[20..21] when full frame is available, with fallback to old index.
+
+   Update flow:
+   1) Build firmware.bin locally.
+   2) Copy it to: /volume1/docker/pool-logger/web/update/poolsniffer.bin
+   3) Open: http://<ESP-IP>/httpota
 */
 
 #include <Arduino.h>
@@ -20,7 +28,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
-#include <ArduinoOTA.h>
+#include <HTTPUpdate.h>
 #include <map>
 
 #include <BLEDevice.h>
@@ -44,13 +52,12 @@ const char* HEARTBEAT_URL = "http://192.168.1.184:8010/api/pool/heartbeat";
 const char* DEVICE_ID = "pool-esp32-01";
 const char* SETUP_AP_SSID = "pool-setup";
 const char* SETUP_AP_PASS = "12345678";
-const char* FIRMWARE_VERSION = "1.1.32-COEX-SAFE";
+const char* FIRMWARE_VERSION = "1.1.34";
 
 const int TEMP_PAIR_INDEX = 13;
 
-const bool ENABLE_OTA = true;
-const unsigned long OTA_BOOT_WINDOW_MS = 30000;
-const unsigned long OTA_ROUTE_WINDOW_MS = 300000;
+const bool ENABLE_HTTP_OTA = true;
+const char* HTTP_OTA_URL = "http://192.168.1.184:8010/update/poolsniffer.bin";
 const unsigned long HEARTBEAT_INTERVAL_MS = 30000;
 const unsigned long SENSOR_TRIGGER_INTERVAL_MS = 120000;
 const unsigned long BATTERY_SCAN_INTERVAL_MS = 30UL * 60UL * 1000UL;
@@ -101,14 +108,17 @@ const int TEMP_SPIKE_CONFIRM_COUNT = 3;
 float lastStablePh = NAN;
 float pendingPh = NAN;
 int pendingPhCount = 0;
-const float PH_SPIKE_THRESHOLD = 0.08f;
-const int PH_SPIKE_CONFIRM_COUNT = 4;
+const float PH_SPIKE_THRESHOLD = 0.15f;      // less sticky than older 0.08/4-confirm setup
+const int PH_SPIKE_CONFIRM_COUNT = 2;
 
 float lastStableOrp = NAN;
 float pendingOrp = NAN;
 int pendingOrpCount = 0;
 const float ORP_SPIKE_THRESHOLD_MV = 35.0f;
-const int ORP_SPIKE_CONFIRM_COUNT = 4;
+const int ORP_SPIKE_CONFIRM_COUNT = 3;
+
+float lastStableCl = NAN;
+const float CL_EMA_ALPHA = 0.35f;            // 0.35 = responsive but smoother than raw spikes
 
 unsigned long lastTrigger = 0;
 unsigned long lastBatteryScan = 0;
@@ -120,7 +130,7 @@ String currentBleStatus = "booting";
 bool pairBleSensor();
 bool connectToSensor();
 void clearBlePairing();
-void openOtaMaintenanceWindow(unsigned long durationMs);
+void performHttpOta();
 void setBleStatus(const String& status);
 void sendHeartbeat(const String& status, bool force = false);
 void printFrame(const std::string& value, const char* source);
@@ -140,12 +150,11 @@ String boolJson(bool v) {
 
 void serviceTasks() {
   if (networkStackStarted && webServerStarted) server.handleClient();
-  if (ENABLE_OTA && networkStackStarted && WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
   yield();
 }
 
-void stopBleForOta() {
-  Serial.println("Stopping BLE for OTA...");
+void stopBleForUpdate() {
+  Serial.println("Stopping BLE for firmware update...");
   pChar = nullptr;
 
   if (pClient != nullptr) {
@@ -166,26 +175,13 @@ void stopBleForOta() {
     delay(500);
   }
 
-  // Extra safety: make sure the BT controller is stopped before OTA disables WiFi sleep.
+  // Extra safety: make sure the BT controller is stopped before firmware update.
   btStop();
   delay(300);
 
   pBLEScan = nullptr;
   lastBleRssi = -999;
-  setBleStatus("ota_ble_stopped");
-}
-
-void openOtaMaintenanceWindow(unsigned long durationMs) {
-  Serial.println("Opening OTA maintenance window...");
-  otaMaintenanceMode = true;
-  otaMaintenanceUntil = millis() + durationMs;
-
-  // First stop BLE. This framework aborts if WiFi sleep is disabled while BT/BLE is active.
-  stopBleForOta();
-  WiFi.setSleep(false);      // OK only after BLE/BT has been stopped for OTA.
-
-  Serial.print("OTA maintenance window active for ms: ");
-  Serial.println(durationMs);
+  setBleStatus("update_ble_stopped");
 }
 
 void ensureBleInitialized() {
@@ -270,7 +266,7 @@ String htmlPage() {
   html += "<h2>Pool ESP32 WiFi Setup</h2>";
   html += "<p>Firmware: " + String(FIRMWARE_VERSION) + "</p>";
   html += "<p>BLE sensor: " + pairedSensorMac + "</p>";
-  html += "<p><a href='/status'>/status</a> &nbsp; <a href='/ota'>/ota</a> &nbsp; <a href='/read'>/read</a> &nbsp; <a href='/pairs'>/pairs</a> &nbsp; <a href='/trigger'>/trigger</a> &nbsp; <a href='/reboot'>/reboot</a></p>";
+  html += "<p><a href='/status'>/status</a> &nbsp; <a href='/httpota'>/httpota</a> &nbsp; <a href='/read'>/read</a> &nbsp; <a href='/pairs'>/pairs</a> &nbsp; <a href='/trigger'>/trigger</a> &nbsp; <a href='/reboot'>/reboot</a></p>";
   html += "<form method='POST' action='/save'><label>WiFi network</label><select name='ssid'>";
   for (int i = 0; i < n; i++) html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
   html += "</select><label>Password</label><input name='pass' type='password' placeholder='WiFi password'>";
@@ -293,8 +289,9 @@ String statusJson() {
   json += "\"ble_rssi_dbm\":" + String(lastBleRssi) + ",";
   json += "\"battery_pct\":";
   json += (batteryPct >= 0.0f ? String(batteryPct, 1) : "null");
-  json += ",\"ota_enabled\":" + boolJson(ENABLE_OTA);
-  json += ",\"ota_maintenance_mode\":" + boolJson(otaMaintenanceMode);
+  json += ",\"http_ota_enabled\":" + boolJson(ENABLE_HTTP_OTA);
+  json += ",\"http_ota_url\":\"" + String(HTTP_OTA_URL) + "\"";
+  json += ",\"firmware_update_mode\":" + boolJson(otaMaintenanceMode);
   json += ",\"temp_pair_index\":" + String(TEMP_PAIR_INDEX);
   json += "}";
   return json;
@@ -325,9 +322,14 @@ void registerWebRoutes() {
     ESP.restart();
   });
 
+  server.on("/httpota", HTTP_GET, []() {
+    server.send(200, "text/plain", "HTTP OTA started. ESP32 will download firmware from: " + String(HTTP_OTA_URL));
+    delay(800);
+    performHttpOta();
+  });
+
   server.on("/ota", HTTP_GET, []() {
-    openOtaMaintenanceWindow(OTA_ROUTE_WINDOW_MS);
-    server.send(200, "text/plain", "OTA mode ON for 5 minutes. Upload firmware now with PlatformIO.");
+    server.send(410, "text/plain", "ArduinoOTA/PlatformIO OTA removed. Use /httpota instead.");
   });
 
   server.on("/status", HTTP_GET, []() { server.send(200, "application/json", statusJson()); });
@@ -371,13 +373,17 @@ void registerWebRoutes() {
     if (!haveLastDecodedFrame) { server.send(404, "text/plain", "No decoded frame yet. Open /read first."); return; }
     String out = "YC01 decoded pair debug\n";
     out += "Firmware: " + String(FIRMWARE_VERSION) + "\n";
+    out += "Decoded length: " + String(lastDecodedLen) + "\n";
     out += "Current temp mapping: decoded[" + String(TEMP_PAIR_INDEX) + ".." + String(TEMP_PAIR_INDEX + 1) + "] / 10.0\n";
-    out += "Display says about 32 C, so look for /10 around 32.0\n\n";
+    out += "pH mapping: decoded[3..4] / 100.0\n";
+    out += "ORP mapping: decoded[20..21] if available, else decoded[9..10] fallback\n\n";
     for (int i = 0; i < (int)lastDecodedLen - 1; i++) {
       uint16_t be = u16RawBE(lastDecodedFrame, i);
       out += "i=" + String(i) + " u16BE=" + String(be) + " /10=" + String(be / 10.0f, 1) + " /100=" + String(be / 100.0f, 2);
       if (be >= 280 && be <= 380) out += "  <-- possible temp";
       if (i == TEMP_PAIR_INDEX) out += "  <-- CURRENT TEMP MAPPING";
+      if (i == 3) out += "  <-- PH MAPPING";
+      if (i == 20) out += "  <-- ORP MAPPING";
       out += "\n";
     }
     server.send(200, "text/plain", out);
@@ -404,7 +410,6 @@ bool connectWiFiFromEEPROM() {
   Serial.print("Connecting WiFi: "); Serial.println(ssid);
   WiFi.mode(WIFI_STA);
   networkStackStarted = true;
-  WiFi.setSleep(true);      // Required when BLE/Bluetooth is active on this framework.
   WiFi.begin(ssid.c_str(), pass.c_str());
 
   unsigned long start = millis();
@@ -416,7 +421,6 @@ bool connectWiFiFromEEPROM() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    WiFi.setSleep(true);    // Keep coexistence stable while BLE is active.
     Serial.print("WiFi connected. IP: "); Serial.println(WiFi.localIP());
     Serial.print("WiFi RSSI="); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
     return true;
@@ -427,45 +431,60 @@ bool connectWiFiFromEEPROM() {
   return false;
 }
 
-// ===================== OTA =====================
+// ===================== HTTP OTA =====================
 
-void setupOTA() {
-  if (!ENABLE_OTA) { Serial.println("OTA disabled in this firmware."); return; }
-  // Do not disable WiFi sleep here; BLE is active. /ota disables it after BLE is stopped.
-  ArduinoOTA.setPort(3232);
-  ArduinoOTA.setHostname("pool-sniffer-esp32");
-
-  ArduinoOTA.onStart([]() {
-    Serial.println("OTA start");
-    stopBleForOta();
-    WiFi.setSleep(false);
-    pChar = nullptr;
-    setBleStatus("ota_start");
-  });
-  ArduinoOTA.onEnd([]() { Serial.println("\nOTA end"); });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    if (total > 0) Serial.printf("OTA progress: %u%%\r", (progress / (total / 100)));
-    yield();
-  });
-  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA error[%u]\n", error); });
-
-  ArduinoOTA.begin();
-  Serial.println("OTA ready.");
-  Serial.println("OTA host: pool-sniffer-esp32");
-  Serial.println("OTA port: 3232");
-}
-
-void runOtaBootWindow() {
-  if (!ENABLE_OTA || WiFi.status() != WL_CONNECTED) return;
-  Serial.print("OTA boot window start: "); Serial.print(OTA_BOOT_WINDOW_MS / 1000); Serial.println(" seconds");
-  unsigned long start = millis();
-  while (millis() - start < OTA_BOOT_WINDOW_MS) {
-    ArduinoOTA.handle();
-    if (webServerStarted) server.handleClient();
-    yield();
-    delay(10);
+void performHttpOta() {
+  if (!ENABLE_HTTP_OTA) {
+    Serial.println("HTTP OTA disabled in firmware.");
+    return;
   }
-  Serial.println("OTA boot window done.");
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("HTTP OTA failed: WiFi not connected.");
+    return;
+  }
+
+  otaMaintenanceMode = true;
+  setBleStatus("http_ota_start");
+
+  Serial.println("================================");
+  Serial.println("HTTP OTA START");
+  Serial.print("URL: ");
+  Serial.println(HTTP_OTA_URL);
+  Serial.println("Stopping BLE before update...");
+
+  stopBleForUpdate();
+  WiFi.setSleep(false);
+  delay(500);
+
+  WiFiClient client;
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  t_httpUpdate_return ret = httpUpdate.update(client, HTTP_OTA_URL);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("HTTP OTA failed: (%d) %s\n",
+                    httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+      setBleStatus("http_ota_failed");
+      otaMaintenanceMode = false;
+      WiFi.setSleep(true);
+      delay(1000);
+      ESP.restart();
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("HTTP OTA: no update.");
+      setBleStatus("http_ota_no_update");
+      otaMaintenanceMode = false;
+      WiFi.setSleep(true);
+      break;
+
+    case HTTP_UPDATE_OK:
+      Serial.println("HTTP OTA OK. Rebooting...");
+      setBleStatus("http_ota_ok");
+      break;
+  }
 }
 
 // ===================== DECODE / FILTER =====================
@@ -488,10 +507,19 @@ float filterTemp(float newTemp) {
 float filterPH(float newPh) {
   if (isnan(lastStablePh)) { lastStablePh = newPh; pendingPh = NAN; pendingPhCount = 0; return newPh; }
   float diff = fabs(newPh - lastStablePh);
-  if (diff <= PH_SPIKE_THRESHOLD) { lastStablePh = newPh; pendingPh = NAN; pendingPhCount = 0; return newPh; }
+
+  // pH is slow but should still show real small movement. Pass normal small changes directly.
+  if (diff <= PH_SPIKE_THRESHOLD) {
+    lastStablePh = newPh;
+    pendingPh = NAN;
+    pendingPhCount = 0;
+    return newPh;
+  }
+
+  // Larger jumps need confirmation, but only two frames so real chemical changes are not hidden too long.
   if (isnan(pendingPh) || fabs(newPh - pendingPh) > 0.08f) { pendingPh = newPh; pendingPhCount = 1; }
   else pendingPhCount++;
-  Serial.printf("pH spike/change candidate confirming: raw=%.2f stable=%.2f count=%d\n", newPh, lastStablePh, pendingPhCount);
+  Serial.printf("pH change candidate confirming: raw=%.2f stable=%.2f count=%d\n", newPh, lastStablePh, pendingPhCount);
   if (pendingPhCount >= PH_SPIKE_CONFIRM_COUNT) { lastStablePh = pendingPh; pendingPh = NAN; pendingPhCount = 0; Serial.printf("pH new stable accepted: %.2f\n", lastStablePh); }
   return lastStablePh;
 }
@@ -499,13 +527,23 @@ float filterPH(float newPh) {
 float filterORP(float newOrp) {
   if (isnan(lastStableOrp)) { lastStableOrp = newOrp; pendingOrp = NAN; pendingOrpCount = 0; return newOrp; }
   float diff = fabs(newOrp - lastStableOrp);
-  if (newOrp > 760.0f && lastStableOrp < 720.0f) { Serial.printf("ORP high-frame ignored: %.0f\n", newOrp); return lastStableOrp; }
+  if (newOrp > 900.0f || newOrp < 0.0f) { Serial.printf("ORP invalid-frame ignored: %.0f\n", newOrp); return lastStableOrp; }
   if (diff <= ORP_SPIKE_THRESHOLD_MV) { lastStableOrp = newOrp; pendingOrp = NAN; pendingOrpCount = 0; return newOrp; }
   if (isnan(pendingOrp) || fabs(newOrp - pendingOrp) > 12.0f) { pendingOrp = newOrp; pendingOrpCount = 1; }
   else pendingOrpCount++;
-  Serial.printf("ORP spike/change candidate confirming: raw=%.0f stable=%.0f count=%d\n", newOrp, lastStableOrp, pendingOrpCount);
+  Serial.printf("ORP change candidate confirming: raw=%.0f stable=%.0f count=%d\n", newOrp, lastStableOrp, pendingOrpCount);
   if (pendingOrpCount >= ORP_SPIKE_CONFIRM_COUNT) { lastStableOrp = pendingOrp; pendingOrp = NAN; pendingOrpCount = 0; Serial.printf("ORP new stable accepted: %.0f\n", lastStableOrp); }
   return lastStableOrp;
+}
+
+float filterChlorine(float newCl) {
+  if (newCl < 0.0f || newCl > 20.0f || isnan(newCl)) return isnan(lastStableCl) ? 0.0f : lastStableCl;
+  if (isnan(lastStableCl)) {
+    lastStableCl = newCl;
+  } else {
+    lastStableCl = (CL_EMA_ALPHA * newCl) + ((1.0f - CL_EMA_ALPHA) * lastStableCl);
+  }
+  return lastStableCl;
 }
 
 static constexpr float CHLORINE_FACTOR = 2.25f;
@@ -556,9 +594,15 @@ bool decodeYC01Payload(const std::string& value, uint8_t* out, size_t& outLen, s
 
 void dumpDecodedYC01Pairs(const uint8_t* d, size_t len) {
   Serial.println("YC01 decoded pair debug:");
+  Serial.print("decodedLen=");
+  Serial.println((int)len);
   for (int i = 0; i < (int)len - 1; i++) {
     uint16_t be = u16RawBE(d, i);
-    Serial.printf("  i=%d u16BE=%u /10=%.1f /100=%.2f\n", i, be, be / 10.0f, be / 100.0f);
+    Serial.printf("  i=%d u16BE=%u /10=%.1f /100=%.2f", i, be, be / 10.0f, be / 100.0f);
+    if (i == 3) Serial.print("  <-- PH");
+    if (i == 20) Serial.print("  <-- ORP");
+    if (i == TEMP_PAIR_INDEX) Serial.print("  <-- TEMP");
+    Serial.println();
   }
 }
 
@@ -588,7 +632,7 @@ void sendHeartbeat(const String& status, bool force) {
   json += "\"ble_rssi_dbm\":" + String(lastBleRssi) + ",";
   json += "\"ble_sensor_mac\":\"" + pairedSensorMac + "\",";
   json += "\"battery_pct\":" + String(batteryPct >= 0.0f ? String(batteryPct, 1) : "null") + ",";
-  json += "\"ota_maintenance_mode\":" + boolJson(otaMaintenanceMode);
+  json += "\"firmware_update_mode\":" + boolJson(otaMaintenanceMode);
   json += "}";
 
   int code = http.POST(json);
@@ -735,6 +779,10 @@ void printFrame(const std::string& value, const char* source) {
   if (!decodeYC01Payload(value, decoded, decodedLen, sizeof(decoded))) {
     Serial.print(source); Serial.print(" | YC01 decode failed | RAW="); Serial.println(rawHex); return;
   }
+
+  Serial.print("decodedLen=");
+  Serial.println((int)decodedLen);
+
   if (decodedLen < 20) {
     Serial.print(source); Serial.print(" | Decoded frame too short | RAW="); Serial.println(rawHex); return;
   }
@@ -742,7 +790,7 @@ void printFrame(const std::string& value, const char* source) {
   uint16_t phU   = u16RawBE(decoded, 3);
   uint16_t ecU   = u16RawBE(decoded, 5);
   uint16_t tdsU  = u16RawBE(decoded, 7);
-  uint16_t orpU  = u16RawBE(decoded, 9);
+  uint16_t orpU  = decodedLen > 21 ? u16RawBE(decoded, 20) : u16RawBE(decoded, 9);
   uint16_t clU   = u16RawBE(decoded, 11);
   uint16_t tempU = u16RawBE(decoded, TEMP_PAIR_INDEX);
   uint16_t battU = u16RawBE(decoded, 15);
@@ -753,10 +801,9 @@ void printFrame(const std::string& value, const char* source) {
   float ph = filterPH(rawPh);
   float rawOrp = (float)orpU + ORP_OFFSET_MV;
   float orp = filterORP(rawOrp);
-  float decodedCl = clU / 10.0f;
+  float decodedClRaw = clU / 10.0f;
   float clEst = estimateChlorine(orp, ph);
-  float cl = decodedCl;
-  if (cl < 0.0f || cl > 20.0f) cl = 0.0f;
+  float cl = filterChlorine(decodedClRaw);
 
   float decodedBattery = battU / 31.9f;
   if (decodedBattery >= 0.0f && decodedBattery <= 100.0f) batteryPct = decodedBattery;
@@ -773,7 +820,7 @@ void printFrame(const std::string& value, const char* source) {
   if (fabs(rawPh - ph) > 0.01f) Serial.printf(" rawPH=%.2f", rawPh);
   Serial.printf(" | ORP≈%.0fmV", orp);
   if (fabs(rawOrp - orp) > 0.5f) Serial.printf(" rawORP=%.0fmV", rawOrp);
-  Serial.printf(" | CL≈%.2fmg/L | CL_est≈%.2fmg/L | EC=%u | TDS=%u", cl, clEst, ecU, tdsU);
+  Serial.printf(" | CL≈%.2fmg/L rawCL=%.2fmg/L | CL_est≈%.2fmg/L | EC=%u | TDS=%u", cl, decodedClRaw, clEst, ecU, tdsU);
   if (batteryPct >= 0.0f) Serial.printf(" | Battery≈%.1f%%", batteryPct); else Serial.print(" | Battery=N/A");
   if (WiFi.status() == WL_CONNECTED) Serial.printf(" | WiFiRSSI=%ddBm", WiFi.RSSI()); else Serial.print(" | WiFiRSSI=N/A");
   Serial.printf(" | BLERSSI=%ddBm | FW=%s | DEC=%s | RAW=%s\n", lastBleRssi, FIRMWARE_VERSION, decodedHex.c_str(), rawHex.c_str());
@@ -932,8 +979,8 @@ void printStatus() {
   Serial.print("Device ID: "); Serial.println(DEVICE_ID);
   Serial.print("Firmware: "); Serial.println(FIRMWARE_VERSION);
   Serial.print("Paired BLE MAC: "); Serial.println(pairedSensorMac);
-  Serial.print("OTA enabled: "); Serial.println(ENABLE_OTA ? "yes" : "no");
-  Serial.print("OTA maintenance mode: "); Serial.println(otaMaintenanceMode ? "yes" : "no");
+  Serial.print("HTTP OTA enabled: "); Serial.println(ENABLE_HTTP_OTA ? "yes" : "no");
+  Serial.print("Firmware update mode: "); Serial.println(otaMaintenanceMode ? "yes" : "no");
   Serial.print("BLE status: "); Serial.println(currentBleStatus);
   Serial.print("Uptime ms: "); Serial.println(millis());
   Serial.print("WiFi: "); Serial.println(WiFi.status() == WL_CONNECTED ? "connected" : "not connected");
@@ -948,7 +995,7 @@ void printStatus() {
 
 void handleNamedCommand(String cmd) {
   cmd.trim(); cmd.toUpperCase();
-  if (cmd == "OTA") { openOtaMaintenanceWindow(OTA_ROUTE_WINDOW_MS); return; }
+  if (cmd == "OTA" || cmd == "HTTPOTA") { performHttpOta(); return; }
   if (cmd == "PAIRS") { if (haveLastDecodedFrame) dumpDecodedYC01Pairs(lastDecodedFrame, lastDecodedLen); else Serial.println("No decoded frame yet. Wait for READ/NOTIFY first."); return; }
   if (cmd == "READ") { if (pChar && pChar->canRead()) { std::string value = pChar->readValue(); printFrame(value, "READ"); } else Serial.println("Cannot READ: pChar missing or not readable."); return; }
   if (cmd == "BAT") { if (pClient && pClient->isConnected()) { pChar = nullptr; pClient->disconnect(); delay(300); } scanBattery(); connectToSensor(); return; }
@@ -960,7 +1007,7 @@ void handleNamedCommand(String cmd) {
   if (cmd == "STATUS") { printStatus(); return; }
   if (cmd == "REBOOT") { Serial.println("Rebooting..."); delay(500); ESP.restart(); }
   if (cmd == "HELP") {
-    Serial.println("Commands: READ, PAIRS, BAT, STATUS, HEARTBEAT, OTA, PAIR, CLEARPAIR, DUMP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
+    Serial.println("Commands: READ, PAIRS, BAT, STATUS, HEARTBEAT, HTTPOTA, PAIR, CLEARPAIR, DUMP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
     return;
   }
   uint8_t raw[32]; size_t len = 0;
@@ -1008,8 +1055,6 @@ void setup() {
   } else {
     registerWebRoutes();
     beginWebServerOnce();
-    setupOTA();
-    runOtaBootWindow();
     sendHeartbeat("esp_online_booted", true);
   }
 
@@ -1024,33 +1069,13 @@ void setup() {
   }
 
   Serial.println("Pool logger ready.");
-  Serial.println("Commands: READ, PAIRS, BAT, PAIR, CLEARPAIR, STATUS, HEARTBEAT, OTA, DUMP, HELP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
+  Serial.println("Commands: READ, PAIRS, BAT, PAIR, CLEARPAIR, STATUS, HEARTBEAT, HTTPOTA, DUMP, HELP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
 }
 
 void loop() {
-  if (ENABLE_OTA && WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
-
   serviceTasks();
   handleSerialCommands();
   serviceTasks();
-
-  if (otaMaintenanceMode) {
-    if ((long)(millis() - otaMaintenanceUntil) < 0) {
-      sendHeartbeat("ota_maintenance", false);
-      for (int i = 0; i < 20; i++) {
-        ArduinoOTA.handle();
-        server.handleClient();
-        delay(5);
-        yield();
-      }
-      return;
-    } else {
-      otaMaintenanceMode = false;
-      Serial.println("OTA maintenance window closed. Rebooting to restart BLE cleanly...");
-      delay(500);
-      ESP.restart();
-    }
-  }
 
   sendHeartbeat(currentBleStatus, false);
 
