@@ -1,4 +1,4 @@
-const FRONTEND_VERSION="web-1.1.41-ui-clean-v7";
+const FRONTEND_VERSION="web-1.1.42-monthview-v8";
 let tempChart=null,phChart=null,clChart=null,orpChart=null;
 const BACKEND_API="/api";
 let currentRange="day";
@@ -69,15 +69,18 @@ function txt(id,t){const e=document.getElementById(id);if(e)e.textContent=t}
 function fmt(ts){
   if(!ts)return"--";
   const d=new Date(ts*1000);
+
   if(currentRange==="day"){
     return d.toLocaleTimeString("sv-SE",{hour:"2-digit",minute:"2-digit"});
   }
+
   if(currentRange==="week"){
-    const day=d.toLocaleDateString("sv-SE",{weekday:"short"});
+    const wd=d.toLocaleDateString("sv-SE",{weekday:"short"});
     const hm=d.toLocaleTimeString("sv-SE",{hour:"2-digit",minute:"2-digit"});
-    return `${day} ${hm}`;
+    return `${wd} ${hm}`;
   }
-  return d.toLocaleDateString("sv-SE",{day:"2-digit",month:"short"});
+
+  return d.toLocaleDateString("sv-SE",{day:"numeric",month:"short"});
 }
 async function get(u){const r=await fetch(u,{cache:"no-store"});if(!r.ok)throw Error(`${u} HTTP ${r.status}`);return await r.json()}
 function sortByTimeAscending(a){

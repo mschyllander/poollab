@@ -5,7 +5,7 @@
   <title>Mr Matzos PoolLab</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <link rel="stylesheet" href="style.css?v=20260513-clean-ui">
+  <link rel="stylesheet" href="style.css?v=20260518-monthview-v8">
 </head>
 <body>
 <main class="dashboard">
@@ -25,8 +25,9 @@
       </div>
     </div>
     <div class="actions">
-      <button id="refreshBtn">Uppdatera</button>
+      <button id="refreshBtn">Ladda om data</button>
       <button id="pairBtn">Pair BLE</button>
+      <button id="manualReadBtn">Läs av nu</button>
       <button id="resetWifiBtn">Reset WiFi</button>
     </div>
   </header>
@@ -35,7 +36,7 @@
     <div class="status-main">
       <span id="onlineDot" class="online-dot unknown"></span>
       <div><small>System</small><strong id="onlineState">Laddar...</strong></div>
-      <em id="lastSeen">--</em>
+      <em id="lastSeen">--</em><em id="uiRefreshHint" class="ui-refresh-hint">--</em>
     </div>
     <div class="tech-meta">
       <span id="deviceId">--</span>
@@ -54,13 +55,14 @@
 
   <section class="metric-grid">
     <article id="tempCard" class="metric"><div class="metric-head"><span class="status-dot" id="tempDot"></span><span>Temperatur</span></div><strong id="temp">-- °C</strong><small><span id="tempHint">Pool/spa</span> <b id="tempTrend">→</b></small></article>
-    <article id="phCard" class="metric"><div class="metric-head"><span class="status-dot" id="phDot"></span><span>pH</span></div><strong id="ph">--</strong><small><span id="phHint">OK 7.0–7.8</span> <b id="phTrend">→</b></small></article>
+    <article id="phCard" class="metric"><div class="metric-head"><span class="status-dot" id="phDot"></span><span>pH</span></div><strong id="ph">--</strong><small><span id="phHint">Rek. 7.0–7.8</span> <b id="phTrend">→</b></small><small id="phInfo" class="metric-note">Kontroll med sticka vid avvikelse</small></article>
     <article id="clCard" class="metric"><div class="metric-head"><span class="status-dot" id="clDot"></span><span>Klor</span></div><strong id="cl">-- mg/L</strong><small><span id="clHint">OK 1.0–3.0 mg/L</span> <b id="clTrend">→</b></small></article>
     <article id="orpCard" class="metric"><div class="metric-head"><span class="status-dot" id="orpDot"></span><span>ORP</span></div><strong id="orp">-- mV</strong><small><span id="orpHint">OK 650–800 mV</span> <b id="orpTrend">→</b></small></article>
-    <article id="batteryCard" class="metric compact"><div class="metric-head"><span class="status-dot" id="batteryDot"></span><span>Batteri</span></div><strong id="battery">-- %</strong><small>BLE-YC01</small></article>
+    <article id="batteryCard" class="metric compact"><div class="metric-head"><span class="status-dot" id="batteryDot"></span><span>Batteri</span></div><strong id="battery">-- %</strong><small><span id="batteryHint">BLE-YC01</span></small></article>
   </section>
 
   <section class="logbar">
+    <div class="time-direction" id="timeDirection"><span>← Äldre data</span><strong></strong><span>Nyare data →</span></div>
     <div><small>Loggvy</small><span id="historyInfo">Visar senaste dygnet</span></div>
     <div class="range-tabs"><button class="range-btn active" data-range="day">Dag</button><button class="range-btn" data-range="week">Vecka</button><button class="range-btn" data-range="month">Månad</button></div>
   </section>
@@ -94,6 +96,6 @@
   </details>
   <span id="modeText" hidden></span>
 </main>
-<script src="app.js?v=20260513-clean-ui"></script>
+<script src="app.js?v=20260518-monthview-v8"></script>
 </body>
 </html>
