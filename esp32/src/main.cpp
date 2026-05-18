@@ -52,18 +52,19 @@ const char* HEARTBEAT_URL = "http://192.168.1.184:8010/api/pool/heartbeat";
 const char* DEVICE_ID = "pool-esp32-01";
 const char* SETUP_AP_SSID = "pool-setup";
 const char* SETUP_AP_PASS = "12345678";
-const char* FIRMWARE_VERSION = "1.1.34";
+const char* FIRMWARE_VERSION = "1.1.40";
 
 const int TEMP_PAIR_INDEX = 13;
+const int PH_PAIR_INDEX = 3;  // Change after comparing PAIRS output with physical sensor display.
 
 const bool ENABLE_HTTP_OTA = true;
 const char* HTTP_OTA_URL = "http://192.168.1.184:8010/update/poolsniffer.bin";
 const unsigned long HEARTBEAT_INTERVAL_MS = 30000;
-const unsigned long SENSOR_TRIGGER_INTERVAL_MS = 120000;
+const unsigned long SENSOR_TRIGGER_INTERVAL_MS = 30UL * 60UL * 1000UL;
 const unsigned long BATTERY_SCAN_INTERVAL_MS = 30UL * 60UL * 1000UL;
 const uint32_t BATTERY_SCAN_SECONDS = 3;
 
-const float TEMP_OFFSET_C = -0.3f;
+const float TEMP_OFFSET_C = 0.0f;
 const float PH_OFFSET = 0.0f;
 const float ORP_OFFSET_MV = 0.0f;
 
@@ -293,6 +294,7 @@ String statusJson() {
   json += ",\"http_ota_url\":\"" + String(HTTP_OTA_URL) + "\"";
   json += ",\"firmware_update_mode\":" + boolJson(otaMaintenanceMode);
   json += ",\"temp_pair_index\":" + String(TEMP_PAIR_INDEX);
+  json += ",\"ph_pair_index\":" + String(PH_PAIR_INDEX);
   json += "}";
   return json;
 }
@@ -333,6 +335,7 @@ void registerWebRoutes() {
   });
 
   server.on("/status", HTTP_GET, []() { server.send(200, "application/json", statusJson()); });
+  server.on("/api/status", HTTP_GET, []() { server.send(200, "application/json", statusJson()); });
 
   server.on("/pair", HTTP_POST, []() {
     if (otaMaintenanceMode) { server.send(409, "text/plain", "OTA maintenance active. Reboot before pairing."); return; }
@@ -369,6 +372,22 @@ void registerWebRoutes() {
     } else server.send(500, "text/plain", "BLE not connected or FF02 not writable.");
   });
 
+
+  server.on("/api/trigger", HTTP_GET, []() {
+    if (otaMaintenanceMode) { server.send(409, "application/json", "{\"ok\":false,\"error\":\"maintenance active\"}"); return; }
+
+    if (!(pClient && pClient->isConnected() && pChar && pChar->canWrite())) {
+      connectToSensor();
+    }
+
+    if (pClient && pClient->isConnected() && pChar && pChar->canWrite()) {
+      sendSensorTrigger();
+      server.send(200, "application/json", "{\"ok\":true,\"trigger\":\"sent\"}");
+    } else {
+      server.send(500, "application/json", "{\"ok\":false,\"error\":\"BLE not connected or FF02 not writable\"}");
+    }
+  });
+
   server.on("/pairs", HTTP_GET, []() {
     if (!haveLastDecodedFrame) { server.send(404, "text/plain", "No decoded frame yet. Open /read first."); return; }
     String out = "YC01 decoded pair debug\n";
@@ -381,7 +400,9 @@ void registerWebRoutes() {
       uint16_t be = u16RawBE(lastDecodedFrame, i);
       out += "i=" + String(i) + " u16BE=" + String(be) + " /10=" + String(be / 10.0f, 1) + " /100=" + String(be / 100.0f, 2);
       if (be >= 280 && be <= 380) out += "  <-- possible temp";
+      if (be >= 550 && be <= 850) out += "  <-- possible pH /100";
       if (i == TEMP_PAIR_INDEX) out += "  <-- CURRENT TEMP MAPPING";
+      if (i == PH_PAIR_INDEX) out += "  <-- CURRENT PH MAPPING";
       if (i == 3) out += "  <-- PH MAPPING";
       if (i == 20) out += "  <-- ORP MAPPING";
       out += "\n";
@@ -787,7 +808,7 @@ void printFrame(const std::string& value, const char* source) {
     Serial.print(source); Serial.print(" | Decoded frame too short | RAW="); Serial.println(rawHex); return;
   }
 
-  uint16_t phU   = u16RawBE(decoded, 3);
+  uint16_t phU   = u16RawBE(decoded, PH_PAIR_INDEX);
   uint16_t ecU   = u16RawBE(decoded, 5);
   uint16_t tdsU  = u16RawBE(decoded, 7);
   uint16_t orpU  = decodedLen > 21 ? u16RawBE(decoded, 20) : u16RawBE(decoded, 9);
@@ -808,6 +829,17 @@ void printFrame(const std::string& value, const char* source) {
   float decodedBattery = battU / 31.9f;
   if (decodedBattery >= 0.0f && decodedBattery <= 100.0f) batteryPct = decodedBattery;
 
+  
+  String phCandidates = "";
+  for (int i = 0; i < (int)decodedLen - 1; i++) {
+    uint16_t beCandidate = u16RawBE(decoded, i);
+    float phCandidate = beCandidate / 100.0f;
+    if (phCandidate >= 4.5f && phCandidate <= 9.5f) {
+      if (phCandidates.length() > 0) phCandidates += " | ";
+      phCandidates += "i=" + String(i) + ":" + String(phCandidate, 2);
+    }
+  }
+
   String decodedHex = bytesToHexString(decoded, decodedLen);
   memcpy(lastDecodedFrame, decoded, decodedLen);
   lastDecodedLen = decodedLen;
@@ -816,14 +848,14 @@ void printFrame(const std::string& value, const char* source) {
   Serial.print(source);
   Serial.printf(" | Temp≈%.1fC", tempC);
   if (fabs(rawTempC - tempC) > 0.05f) Serial.printf(" rawTemp=%.1fC", rawTempC);
-  Serial.printf(" | tempPairIndex=%d | pH≈%.2f", TEMP_PAIR_INDEX, ph);
+  Serial.printf(" | tempPairIndex=%d | phPairIndex=%d | pH≈%.2f", TEMP_PAIR_INDEX, PH_PAIR_INDEX, ph);
   if (fabs(rawPh - ph) > 0.01f) Serial.printf(" rawPH=%.2f", rawPh);
   Serial.printf(" | ORP≈%.0fmV", orp);
   if (fabs(rawOrp - orp) > 0.5f) Serial.printf(" rawORP=%.0fmV", rawOrp);
   Serial.printf(" | CL≈%.2fmg/L rawCL=%.2fmg/L | CL_est≈%.2fmg/L | EC=%u | TDS=%u", cl, decodedClRaw, clEst, ecU, tdsU);
   if (batteryPct >= 0.0f) Serial.printf(" | Battery≈%.1f%%", batteryPct); else Serial.print(" | Battery=N/A");
   if (WiFi.status() == WL_CONNECTED) Serial.printf(" | WiFiRSSI=%ddBm", WiFi.RSSI()); else Serial.print(" | WiFiRSSI=N/A");
-  Serial.printf(" | BLERSSI=%ddBm | FW=%s | DEC=%s | RAW=%s\n", lastBleRssi, FIRMWARE_VERSION, decodedHex.c_str(), rawHex.c_str());
+  Serial.printf(" | BLERSSI=%ddBm | FW=%s | PH candidates /100: %s | DEC=%s | RAW=%s\n", lastBleRssi, FIRMWARE_VERSION, phCandidates.c_str(), decodedHex.c_str(), rawHex.c_str());
 
   setBleStatus("ble_ok");
   sendHeartbeat(currentBleStatus, true);
