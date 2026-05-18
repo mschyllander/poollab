@@ -1,14 +1,31 @@
-const FRONTEND_VERSION="web-1.1.35-clean-ui";
+const FRONTEND_VERSION="web-1.1.41-ui-clean-v7";
 let tempChart=null,phChart=null,clChart=null,orpChart=null;
 const BACKEND_API="/api";
 let currentRange="day";
 const LIMITS={ph:{okLow:7.0,okHigh:7.8,critLow:6.8,critHigh:8.2},cl:{okLow:1.0,okHigh:3.0,critLow:.3,critHigh:5.0},orp:{okLow:650,okHigh:800,critLow:600,critHigh:900}};
 const ESP_ONLINE_SECONDS=90;       // heartbeat every 30s, so 90s is a fair timeout
-const MEASUREMENT_OLD_SECONDS=180; // old water values if no real sensor measurement for 3 min
+const MEASUREMENT_OLD_SECONDS=2700; // old water values if no real sensor measurement for 45 min // old water values if no real sensor measurement for 3 min
 
 document.getElementById("refreshBtn")?.addEventListener("click",loadData);
 document.querySelectorAll(".range-btn").forEach(btn=>btn.addEventListener("click",()=>{document.querySelectorAll(".range-btn").forEach(b=>b.classList.remove("active"));btn.classList.add("active");currentRange=btn.dataset.range||"day";loadData()}));
 document.getElementById("pairBtn")?.addEventListener("click",async()=>{try{const r=await fetch("/pair",{method:"POST"});alert(r.ok?"PAIR startad på ESP32.":"PAIR misslyckades. Kör PAIR i Serial Monitor.")}catch(e){alert("PAIR fungerar bara om /pair-routen nås direkt på ESP32. Annars kör PAIR i Serial Monitor.")}});
+document.getElementById("manualReadBtn")?.addEventListener("click",async()=>{
+  const btn=document.getElementById("manualReadBtn");
+  const oldText=btn?btn.textContent:"";
+  try{
+    if(btn){btn.disabled=true;btn.textContent="Läser av...";}
+    const r=await fetch("/mcu/api/trigger",{method:"GET",cache:"no-store"});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    txt("packetHint","Manuell avläsning skickad");
+    setTimeout(loadData,3000);
+    setTimeout(loadData,8000);
+  }catch(e){
+    alert("Kunde inte trigga manuell avläsning. Testa http://ESP-IP/api/trigger direkt och kontrollera nginx /mcu/api/ proxy.");
+    console.error("manual read failed:",e);
+  }finally{
+    if(btn){setTimeout(()=>{btn.disabled=false;btn.textContent=oldText||"Läs av nu";},1200);}
+  }
+});
 document.getElementById("resetWifiBtn")?.addEventListener("click",async()=>{if(!confirm("Rensa WiFi? ESP32 startar om om /clear nås direkt."))return;try{const r=await fetch("/clear",{method:"POST"});alert(r.ok?"WiFi reset skickad.":"Kunde inte resetta WiFi via web. Kör CLEARWIFI i Serial Monitor.")}catch(e){alert("Reset WiFi finns i ESP setup-portal eller via CLEARWIFI i Serial Monitor.")}});
 
 function n(v,d=1){return v==null||Number.isNaN(Number(v))?"--":Number(v).toFixed(d)}
@@ -40,18 +57,38 @@ function clRawValue(o){
 function ensureClInfo(){let e=document.getElementById("clInfo");if(e)return e;const card=document.getElementById("clCard");if(!card)return null;e=document.createElement("small");e.id="clInfo";e.className="metric-note";e.textContent="Klor stabiliserat";card.appendChild(e);return e}
 function setClInfo(latest,history){
   const e=ensureClInfo();if(!e)return;
-  const sigma=sdNums((Array.isArray(history)?history:[]).slice(-60).map(x=>x?.cl_mg_l));
-  const hasRaw=(Array.isArray(history)?history:[]).some(x=>clRawValue(x)!=null) || clRawValue(latest)!=null;
-  const parts=["Klor stabiliserat"];
-  if(hasRaw)parts.push("rådata finns");
-  if(sigma!=null)parts.push(`σ60 ${sigma.toFixed(4)}`);
-  e.textContent=parts.join(" · ");
+  const v=Number(latest?.cl_mg_l);
+  if(!Number.isFinite(v)){e.textContent="Rek. 1.0–3.0 mg/L";return}
+  if(v<1.0)e.textContent="Öka klorhalt";
+  else if(v>3.0)e.textContent="Sänk/avvakta klor";
+  else e.textContent="Rek. 1.0–3.0 mg/L";
 }
 function first(...a){for(const v of a){const x=Number(v);if(v!=null&&Number.isFinite(x)&&x>=0)return x}return null}
 function firstSigned(...a){for(const v of a){const x=Number(v);if(v!=null&&Number.isFinite(x))return x}return null}
 function txt(id,t){const e=document.getElementById(id);if(e)e.textContent=t}
-function fmt(ts){if(!ts)return"--";const o=currentRange==="day"?{hour:"2-digit",minute:"2-digit"}:{month:"2-digit",day:"2-digit",hour:"2-digit"};return new Date(ts*1000).toLocaleString("sv-SE",o)}
+function fmt(ts){
+  if(!ts)return"--";
+  const d=new Date(ts*1000);
+  if(currentRange==="day"){
+    return d.toLocaleTimeString("sv-SE",{hour:"2-digit",minute:"2-digit"});
+  }
+  if(currentRange==="week"){
+    const day=d.toLocaleDateString("sv-SE",{weekday:"short"});
+    const hm=d.toLocaleTimeString("sv-SE",{hour:"2-digit",minute:"2-digit"});
+    return `${day} ${hm}`;
+  }
+  return d.toLocaleDateString("sv-SE",{day:"2-digit",month:"short"});
+}
 async function get(u){const r=await fetch(u,{cache:"no-store"});if(!r.ok)throw Error(`${u} HTTP ${r.status}`);return await r.json()}
+function sortByTimeAscending(a){
+  return (Array.isArray(a)?a:[])
+    .slice()
+    .sort((x,y)=>{
+      const ax=Number(x?.ts_unix ?? x?.ts ?? x?.created_at ?? 0);
+      const ay=Number(y?.ts_unix ?? y?.ts ?? y?.created_at ?? 0);
+      return ax-ay;
+    });
+}
 function hist(h){return h&&Array.isArray(h.data)?h.data:Array.isArray(h)?h:[]}
 function ds(a,m=550){if(!Array.isArray(a)||a.length<=m)return a;const s=Math.ceil(a.length/m);return a.filter((_,i)=>i%s===0)}
 function secText(a){if(a==null||Number.isNaN(Number(a)))return"okänd tid";a=Number(a);if(a<90)return`${Math.round(a)} s sedan`;const m=Math.round(a/60);if(m<120)return`${m} min sedan`;const h=(a/3600).toFixed(1).replace(".0","");return`${h} tim sedan`}
@@ -69,8 +106,8 @@ function friendlyPacketHint(age, espOnline){
 function rssi(r){if(r==null||Number.isNaN(Number(r))||Number(r)<=-999)return{level:0,text:"Ingen kontakt",cls:"bad"};r=Number(r);if(r>=-60)return{level:4,text:"Bra",cls:"good"};if(r>=-75)return{level:3,text:"Okej",cls:"good"};if(r>=-85)return{level:2,text:"Svag",cls:"warn"};return{level:1,text:"Mycket svag",cls:"bad"}}
 function setSig(p,r,overrideText=null,overrideCls=null){const q=rssi(r);txt(`${p}Rssi`,r==null||Number(r)<=-999?"-- dBm":`${r} dBm`);const h=document.getElementById(`${p}Hint`);if(h){h.textContent=overrideText||q.text;h.className=overrideCls||q.cls}const b=document.getElementById(`${p}SignalBars`);if(b){b.className=`signal-bars level-${q.level} ${overrideCls||q.cls}`;b.innerHTML="<i></i><i></i><i></i><i></i>"}}
 function clsRange(v,l,lo="lågt",hi="högt"){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:50};v=Number(v);if(v>=l.okLow&&v<=l.okHigh)return{state:"ok",text:"OK",score:100};if(v<l.critLow)return{state:"critical",text:`akut ${lo}`,score:20};if(v>l.critHigh)return{state:"critical",text:`akut ${hi}`,score:20};return v<l.okLow?{state:"low",text:lo,score:65}:{state:"high",text:hi,score:65}}
-function clsTemp(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:50,cls:""};v=Number(v);if(v<15)return{state:"low",text:"kallt",score:70,cls:"temp-cold"};if(v<30)return{state:"ok",text:"OK pool",score:100,cls:"temp-normal"};if(v<=38)return{state:"ok",text:"OK spa",score:100,cls:"temp-normal"};if(v<=40)return{state:"high",text:"varmt",score:75,cls:"temp-warm"};return{state:"critical",text:"hett",score:35,cls:"temp-hot"}}
-function clsBat(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:60};v=Number(v);if(v>=35)return{state:"ok",text:"OK",score:100};if(v>=15)return{state:"high",text:"lågt",score:65};return{state:"critical",text:"kritiskt",score:25}}
+function clsTemp(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:50,cls:""};v=Number(v);if(v<15)return{state:"low",text:"Kallt",score:70,cls:"temp-cold"};if(v<30)return{state:"ok",text:"Normal pool",score:100,cls:"temp-normal"};if(v<=38)return{state:"ok",text:"Varmt pool/spa",score:100,cls:"temp-normal"};if(v<=40)return{state:"high",text:"Varmt",score:75,cls:"temp-warm"};return{state:"critical",text:"För varmt",score:35,cls:"temp-hot"}}
+function clsBat(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:60};v=Number(v);if(v>=70)return{state:"ok",text:"Bra",score:100};if(v>=50)return{state:"high",text:"Kontrollera",score:70};if(v>=30)return{state:"high",text:"Batteri lågt",score:45};return{state:"critical",text:"Byt/ladda batteri",score:20}}
 function dot(id,s){const e=document.getElementById(id);if(e)e.className=`status-dot ${s}`}
 function setTemp(v,r){const e=document.getElementById("tempCard");if(e){e.classList.remove("temp-cold","temp-normal","temp-warm","temp-hot");if(r.cls)e.classList.add(r.cls)}dot("tempDot",r.state);txt("tempHint",r.text)}
 function setM(dotId,hintId,r){dot(dotId,r.state);txt(hintId,r.text)}
@@ -146,7 +183,38 @@ function waterStatus(r, measurementOld, bleOffline, ble){
 function bleStatusText(s){s=String(s||"unknown");if(s.includes("ok")||s.includes("ready"))return"BLE OK";if(s.includes("trigger_sent"))return"Väntar";if(s.includes("connect_failed"))return"Ej ansluten";if(s.includes("advertisement_not_found"))return"Hittas inte";if(s.includes("not_found"))return"Hittas inte";if(s.includes("booted"))return"Väntar";return s.replaceAll("_"," ")}
 function getAges(state,latest){const hb=state?.heartbeat||{};const hbAge=Number(state?.heartbeat_age_seconds);const espAge=Number.isFinite(hbAge)?hbAge:null;const measAge=Number(state?.last_seen_seconds_ago ?? latest?.last_seen_seconds_ago);return{hb,espAge,measAge:Number.isFinite(measAge)?measAge:null}}
 
-async function loadData(){try{const [latest,hr,state]=await Promise.all([get(`${BACKEND_API}/pool/latest`),get(`${BACKEND_API}/pool/history?range=${currentRange}`),get(`${BACKEND_API}/pool/state`)]);const all=hist(hr),h=ds(all),last=all.length?all[all.length-1]:null,sl=state&&state.latest?state.latest:null;
+let loadingAnimTimer=null;
+let loadingAnimStep=0;
+
+function setLastUiRefresh(){
+  const t=new Date().toLocaleTimeString("sv-SE",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  const e=document.getElementById("uiRefreshHint");
+  if(e)e.textContent=`UI uppdaterad ${t}`;
+}
+
+function setLoadingText(base="Laddar"){
+  const dots=[".","..","...",".."];
+  const text=`${base}${dots[loadingAnimStep%dots.length]}`;
+  txt("onlineState",text);
+  txt("lastSeen","hämtar data");
+  loadingAnimStep++;
+}
+
+function startLoadingAnimation(base="Laddar"){
+  stopLoadingAnimation();
+  loadingAnimStep=0;
+  setLoadingText(base);
+  loadingAnimTimer=setInterval(()=>setLoadingText(base),380);
+}
+
+function stopLoadingAnimation(){
+  if(loadingAnimTimer){
+    clearInterval(loadingAnimTimer);
+    loadingAnimTimer=null;
+  }
+}
+
+async function loadData(){startLoadingAnimation("Laddar");try{const [latest,hr,state]=await Promise.all([get(`${BACKEND_API}/pool/latest`),get(`${BACKEND_API}/pool/history?range=${currentRange}`),get(`${BACKEND_API}/pool/state`)]);stopLoadingAnimation();setLastUiRefresh();const all=sortByTimeAscending(hist(hr)),h=ds(all),last=all.length?all[all.length-1]:null,sl=state&&state.latest?state.latest:null;
     const {hb,espAge,measAge}=getAges(state,latest);
     const espOnline=espAge!=null&&espAge<=ESP_ONLINE_SECONDS;
     const measurementOld=measAge==null||measAge>MEASUREMENT_OLD_SECONDS;
@@ -169,13 +237,14 @@ async function loadData(){try{const [latest,hr,state]=await Promise.all([get(`${
     txt("historyInfo",`${currentRange==="day"?"Visar senaste dygnet":currentRange==="week"?"Visar senaste veckan":"Visar senaste månaden"} · ${all.length} mätpunkter`);
     txt("deviceId",hb?.device_id||latest?.device_id||"--");
     txt("firmwareVersion",`${espOnline?"FW":"Senast FW"}: ${hb?.firmware_version||latest?.firmware_version||"--"}`);
+    txt("phInfo","Kontroll med sticka vid avvikelse");
 
     if(!latest||latest.ok===false){setCardState("wifiCard",espOnline?"ok":"bad");setCardState("bleCard",bleOffline?"bad":"stale");setCardState("packetCard",espOnline?(measurementOld?"warn":"ok"):"bad");setCardState("waterCard","stale");txt("packetAge", friendlyHeartbeatText(espAge));txt("packetHint", friendlyPacketHint(espAge, espOnline));txt("healthScore","--%");txt("healthText","Inga mätvärden");setStabilitySummary([]);drawCharts([],[],[],[],[]);return}
 
     const wifiRssi=firstSigned(hb?.wifi_rssi_dbm,latest?.wifi_rssi_dbm,sl?.wifi_rssi_dbm,last?.wifi_rssi_dbm);
     const bleRssi=firstSigned(hb?.ble_rssi_dbm,latest?.ble_rssi_dbm,sl?.ble_rssi_dbm,last?.ble_rssi_dbm);
     const bat=first(hb?.battery_pct,latest?.battery_pct,sl?.battery_pct,last?.battery_pct);
-    txt("temp",`${n(latest.temp_c,1)} °C`);txt("ph",n(latest.ph,3));txt("orp",`${n(latest.orp_mv,0)} mV`);txt("cl",`${n(latest.cl_mg_l,3)} mg/L`);txt("battery",bat==null?"-- %":`${bat.toFixed(1)} %`);txt("rawHex",latest.raw_hex||"--");setClInfo(latest,all);setStabilitySummary(all);
+    txt("temp",`${n(latest.temp_c,1)} °C`);txt("ph",n(latest.ph,2));txt("orp",`${n(latest.orp_mv,0)} mV`);txt("cl",`${n(latest.cl_mg_l,2)} mg/L`);txt("battery",bat==null?"-- %":`${bat.toFixed(1)} %`);txt("rawHex",latest.raw_hex||"--");setClInfo(latest,all);setStabilitySummary(all);
 
     setSig("wifi",wifiRssi,espOnline?null:"ingen heartbeat",espOnline?null:"bad");
     setSig("ble",bleRssi,bleConnected?"ansluten":bleStatusText(hb?.ble_status),bleConnected?"good":"warn");
@@ -186,10 +255,10 @@ async function loadData(){try{const [latest,hr,state]=await Promise.all([get(`${
     setCardState("bleCard",bleConnected?"ok":espOnline?"warn":"stale");
     setCardState("waterCard",measurementOld?"stale":bleOffline?"warn":"ok");
 
-    const R={temp:clsTemp(latest.temp_c),ph:clsRange(latest.ph,LIMITS.ph,"lågt","högt"),cl:clsRange(latest.cl_mg_l,LIMITS.cl,"lågt","högt"),orp:clsRange(latest.orp_mv,LIMITS.orp,"lågt","högt"),battery:clsBat(bat)};setTemp(latest.temp_c,R.temp);setM("phDot","phHint",R.ph);setM("clDot","clHint",R.cl);setM("orpDot","orpHint",R.orp);dot("batteryDot",R.battery.state);txt("tempTrend",trend(all,"temp_c"));txt("phTrend",trend(all,"ph"));txt("clTrend",trend(all,"cl_mg_l"));txt("orpTrend",trend(all,"orp_mv"));
+    const R={temp:clsTemp(latest.temp_c),ph:clsRange(latest.ph,LIMITS.ph,"under mål","över mål"),cl:clsRange(latest.cl_mg_l,LIMITS.cl,"lågt","högt"),orp:clsRange(latest.orp_mv,LIMITS.orp,"under mål","över mål"),battery:clsBat(bat)};setTemp(latest.temp_c,R.temp);setM("phDot","phHint",R.ph);setM("clDot","clHint",R.cl);setM("orpDot","orpHint",R.orp);dot("batteryDot",R.battery.state);txt("batteryHint",R.battery.text);txt("tempTrend",trend(all,"temp_c"));txt("phTrend",trend(all,"ph"));txt("clTrend",trend(all,"cl_mg_l"));txt("orpTrend",trend(all,"orp_mv"));
     const H=waterStatus(R,measurementOld,bleOffline,bleRssi);txt("healthScore",H.text);txt("healthText",H.detail || `${H.score}%`);const hs=document.getElementById("healthScore");if(hs)hs.style.color=H.color;
     drawCharts(h.map(x=>fmt(x.ts_unix)),h.map(x=>x.temp_c),h.map(x=>x.ph),h.map(x=>x.cl_mg_l),h.map(x=>x.orp_mv),h.map(x=>clRawValue(x)))
-  }catch(e){setPageState("backend-offline",e.message);setCardState("wifiCard","bad");setCardState("bleCard","bad");setCardState("packetCard","bad");setCardState("waterCard","bad");txt("packetAge","--");txt("packetHint","API fel");txt("healthScore","--%");txt("healthText","Backend saknas");setStabilitySummary([]);console.error(e)}}
+  }catch(e){stopLoadingAnimation();setPageState("backend-offline",`API fel: ${e.message}`);setCardState("wifiCard","bad");setCardState("bleCard","bad");setCardState("packetCard","bad");setCardState("waterCard","bad");txt("packetAge","--");txt("packetHint","API fel");txt("healthScore","--%");txt("healthText","Backend saknas");setStabilitySummary([]);console.error(e)}}
 
 const rangeBandPlugin={id:"rangeBandPlugin",beforeDatasetsDraw(chart){const l=chart.options.plugins.rangeBand;if(!l)return;const{ctx,chartArea,scales}=chart,y=scales.y;if(!y||!chartArea)return;const y1=y.getPixelForValue(l.okLow??l.min),y2=y.getPixelForValue(l.okHigh??l.max),top=Math.min(y1,y2),bot=Math.max(y1,y2);ctx.save();ctx.fillStyle=l.fillColor||"rgba(103,255,159,.11)";ctx.fillRect(chartArea.left,top,chartArea.right-chartArea.left,bot-top);ctx.strokeStyle=l.strokeColor||"rgba(103,255,159,.36)";ctx.lineWidth=.5;ctx.setLineDash([4,5]);for(const yy of [y1,y2]){ctx.beginPath();ctx.moveTo(chartArea.left,yy);ctx.lineTo(chartArea.right,yy);ctx.stroke()}ctx.restore()}};
 try{Chart.register(rangeBandPlugin)}catch(e){console.warn("Chart plugin register skipped",e)}
