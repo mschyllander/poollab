@@ -52,10 +52,10 @@ const char* HEARTBEAT_URL = "http://192.168.1.184:8010/api/pool/heartbeat";
 const char* DEVICE_ID = "pool-esp32-01";
 const char* SETUP_AP_SSID = "pool-setup";
 const char* SETUP_AP_PASS = "12345678";
-const char* FIRMWARE_VERSION = "1.1.40";
+const char* FIRMWARE_VERSION = "1.1.42";
 
 const int TEMP_PAIR_INDEX = 13;
-const int PH_PAIR_INDEX = 3;  // Change after comparing PAIRS output with physical sensor display.
+const int PH_PAIR_INDEX = 3;  // BLE raw pH pair.
 
 const bool ENABLE_HTTP_OTA = true;
 const char* HTTP_OTA_URL = "http://192.168.1.184:8010/update/poolsniffer.bin";
@@ -290,6 +290,8 @@ String statusJson() {
   json += "\"ble_rssi_dbm\":" + String(lastBleRssi) + ",";
   json += "\"battery_pct\":";
   json += (batteryPct >= 0.0f ? String(batteryPct, 1) : "null");
+  json += ",\"battery_chemistry\":\"liion_1s\"";
+  json += ",\"battery_source\":\"ble_yc01_advertisement_or_decoded_frame\"";
   json += ",\"http_ota_enabled\":" + boolJson(ENABLE_HTTP_OTA);
   json += ",\"http_ota_url\":\"" + String(HTTP_OTA_URL) + "\"";
   json += ",\"firmware_update_mode\":" + boolJson(otaMaintenanceMode);
@@ -394,13 +396,13 @@ void registerWebRoutes() {
     out += "Firmware: " + String(FIRMWARE_VERSION) + "\n";
     out += "Decoded length: " + String(lastDecodedLen) + "\n";
     out += "Current temp mapping: decoded[" + String(TEMP_PAIR_INDEX) + ".." + String(TEMP_PAIR_INDEX + 1) + "] / 10.0\n";
-    out += "pH mapping: decoded[3..4] / 100.0\n";
+    out += "pH mapping: decoded[PH_PAIR_INDEX..PH_PAIR_INDEX+1] / 100.0 + PH_OFFSET\n";
     out += "ORP mapping: decoded[20..21] if available, else decoded[9..10] fallback\n\n";
     for (int i = 0; i < (int)lastDecodedLen - 1; i++) {
       uint16_t be = u16RawBE(lastDecodedFrame, i);
       out += "i=" + String(i) + " u16BE=" + String(be) + " /10=" + String(be / 10.0f, 1) + " /100=" + String(be / 100.0f, 2);
       if (be >= 280 && be <= 380) out += "  <-- possible temp";
-      if (be >= 550 && be <= 850) out += "  <-- possible pH /100";
+      if ((be / 100.0f) >= 4.5f && (be / 100.0f) <= 9.5f) out += "  <-- possible pH";
       if (i == TEMP_PAIR_INDEX) out += "  <-- CURRENT TEMP MAPPING";
       if (i == PH_PAIR_INDEX) out += "  <-- CURRENT PH MAPPING";
       if (i == 3) out += "  <-- PH MAPPING";
@@ -653,6 +655,8 @@ void sendHeartbeat(const String& status, bool force) {
   json += "\"ble_rssi_dbm\":" + String(lastBleRssi) + ",";
   json += "\"ble_sensor_mac\":\"" + pairedSensorMac + "\",";
   json += "\"battery_pct\":" + String(batteryPct >= 0.0f ? String(batteryPct, 1) : "null") + ",";
+  json += "\"battery_chemistry\":\"liion_1s\",";
+  json += "\"battery_source\":\"ble_yc01_advertisement_or_decoded_frame\",";
   json += "\"firmware_update_mode\":" + boolJson(otaMaintenanceMode);
   json += "}";
 
@@ -664,7 +668,7 @@ void sendHeartbeat(const String& status, bool force) {
   serviceTasks();
 }
 
-void postMeasurement(float tempC, float ph, float orp, float cl, float battery, const String& rawHex) {
+void postMeasurement(float tempC, float ph, float orp, float cl, float battery, float rawTempC, float rawPhBle, float rawOrp, float rawCl, const String& rawHex) {
   if (WiFi.status() != WL_CONNECTED || otaMaintenanceMode) return;
   serviceTasks();
 
@@ -680,7 +684,13 @@ void postMeasurement(float tempC, float ph, float orp, float cl, float battery, 
   json += "\"ph\":" + String(ph, 2) + ",";
   json += "\"orp_mv\":" + String(orp, 0) + ",";
   json += "\"cl_mg_l\":" + String(cl, 2) + ",";
+  json += "\"raw_temp_c\":" + String(rawTempC, 2) + ",";
+  json += "\"raw_ph\":" + String(rawPhBle, 2) + ",";
+  json += "\"raw_orp_mv\":" + String(rawOrp, 0) + ",";
+  json += "\"raw_cl_mg_l\":" + String(rawCl, 2) + ",";
   json += "\"battery_pct\":" + String(battery >= 0.0f ? String(battery, 1) : "null") + ",";
+  json += "\"battery_chemistry\":\"liion_1s\",";
+  json += "\"battery_source\":\"ble_yc01_advertisement_or_decoded_frame\",";
   json += "\"wifi_rssi_dbm\":" + String(WiFi.RSSI()) + ",";
   json += "\"ble_rssi_dbm\":" + String(lastBleRssi) + ",";
   json += "\"firmware_version\":\"" + String(FIRMWARE_VERSION) + "\",";
@@ -818,8 +828,13 @@ void printFrame(const std::string& value, const char* source) {
 
   float rawTempC = (tempU / 10.0f) + TEMP_OFFSET_C;
   float tempC = filterTemp(rawTempC);
-  float rawPh = (phU / 100.0f) + PH_OFFSET;
-  float ph = filterPH(rawPh);
+  float rawPhBle = phU / 100.0f;
+
+  // BLE decoded pH already matches the sensor display in current tests.
+  // Keep PH_OFFSET at 0.0f unless future calibration proves a fixed offset is needed.
+  float rawPh = rawPhBle + PH_OFFSET;
+  float ph = rawPh;
+
   float rawOrp = (float)orpU + ORP_OFFSET_MV;
   float orp = filterORP(rawOrp);
   float decodedClRaw = clU / 10.0f;
@@ -849,17 +864,17 @@ void printFrame(const std::string& value, const char* source) {
   Serial.printf(" | Temp≈%.1fC", tempC);
   if (fabs(rawTempC - tempC) > 0.05f) Serial.printf(" rawTemp=%.1fC", rawTempC);
   Serial.printf(" | tempPairIndex=%d | phPairIndex=%d | pH≈%.2f", TEMP_PAIR_INDEX, PH_PAIR_INDEX, ph);
-  if (fabs(rawPh - ph) > 0.01f) Serial.printf(" rawPH=%.2f", rawPh);
+  if (fabs(rawPh - ph) > 0.01f) Serial.printf(" rawPHdisplay=%.2f rawPHble=%.2f", rawPh, rawPhBle);
   Serial.printf(" | ORP≈%.0fmV", orp);
   if (fabs(rawOrp - orp) > 0.5f) Serial.printf(" rawORP=%.0fmV", rawOrp);
   Serial.printf(" | CL≈%.2fmg/L rawCL=%.2fmg/L | CL_est≈%.2fmg/L | EC=%u | TDS=%u", cl, decodedClRaw, clEst, ecU, tdsU);
   if (batteryPct >= 0.0f) Serial.printf(" | Battery≈%.1f%%", batteryPct); else Serial.print(" | Battery=N/A");
   if (WiFi.status() == WL_CONNECTED) Serial.printf(" | WiFiRSSI=%ddBm", WiFi.RSSI()); else Serial.print(" | WiFiRSSI=N/A");
-  Serial.printf(" | BLERSSI=%ddBm | FW=%s | PH candidates /100: %s | DEC=%s | RAW=%s\n", lastBleRssi, FIRMWARE_VERSION, phCandidates.c_str(), decodedHex.c_str(), rawHex.c_str());
+  Serial.printf(" | BLERSSI=%ddBm | FW=%s | pH candidates /100: %s | DEC=%s | RAW=%s\n", lastBleRssi, FIRMWARE_VERSION, phCandidates.c_str(), decodedHex.c_str(), rawHex.c_str());
 
   setBleStatus("ble_ok");
   sendHeartbeat(currentBleStatus, true);
-  postMeasurement(tempC, ph, orp, cl, batteryPct, rawHex);
+  postMeasurement(tempC, ph, orp, cl, batteryPct, rawTempC, rawPhBle, rawOrp, decodedClRaw, rawHex);
 }
 
 void notifyCallback(BLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
@@ -1022,6 +1037,12 @@ void printStatus() {
   Serial.print("BLE connected: "); Serial.println((pClient && pClient->isConnected()) ? "yes" : "no");
   Serial.print("Temperature decode: decoded["); Serial.print(TEMP_PAIR_INDEX); Serial.print(".."); Serial.print(TEMP_PAIR_INDEX + 1); Serial.println("] / 10.0");
   Serial.print("Calibration temp offset: "); Serial.println(TEMP_OFFSET_C);
+  Serial.print("pH decode: ");
+  Serial.print("decoded[");
+  Serial.print(PH_PAIR_INDEX);
+  Serial.print("..");
+  Serial.print(PH_PAIR_INDEX + 1);
+  Serial.println("] /100 + PH_OFFSET");
   Serial.println("==============================");
 }
 
