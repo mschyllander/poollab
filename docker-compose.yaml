@@ -1,0 +1,32 @@
+services:
+  pool-backend:
+    image: tiangolo/uvicorn-gunicorn-fastapi:python3.11
+    container_name: pool-backend
+    network_mode: host
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+      - ./backend/data:/app/data
+    command: uvicorn app:app --host 127.0.0.1 --port 8011
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  pool-web:
+    image: nginx:alpine
+    container_name: pool-web
+    network_mode: host
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - pool-backend
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

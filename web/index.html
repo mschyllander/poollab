@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <title>Mr Matzos PoolLab</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="style.css?v=20260518-polish-v22">
+</head>
+<body>
+<main class="dashboard">
+  <header class="topbar">
+    <div class="header-bubbles" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+    <div class="brand">
+      <div class="pool-logo" aria-hidden="true">
+        <div class="pool-water">
+          <span class="bubble b1"></span><span class="bubble b2"></span><span class="bubble b3"></span><span class="bubble b4"></span>
+          <span class="wave w1"></span><span class="wave w2"></span>
+        </div>
+      </div>
+      <div class="brand-title">
+        <span class="hero-bubble hb1"></span><span class="hero-bubble hb2"></span><span class="hero-bubble hb3"></span><span class="hero-bubble hb4"></span>
+        <h1>Mr Matzos PoolLab</h1>
+        <p>Pool & spa-monitor · BLE-YC01 via ESP32</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="refreshBtn">Ladda om data</button>
+      <button id="pairBtn">Pair BLE</button>
+      <button id="manualReadBtn">Läs av nu</button>
+      <button id="resetWifiBtn">Reset WiFi</button>
+    </div>
+  </header>
+
+  <section class="status-strip">
+    <div class="status-main">
+      <span id="onlineDot" class="online-dot unknown"></span>
+      <div><small>System</small><strong id="onlineState">Laddar...</strong></div>
+      <em id="lastSeen">--</em><em id="uiRefreshHint" class="ui-refresh-hint">--</em>
+    </div>
+    <div class="tech-meta">
+      <span id="deviceId">--</span>
+      <span id="backendVersion">Backend: --</span>
+      <span id="firmwareVersion">ESP FW: --</span>
+      <span><b id="count">--</b> mätningar</span>
+    </div>
+  </section>
+
+  <section class="quick-row">
+    <article id="wifiCard"><small>WiFi</small><b id="wifiRssi">-- dBm</b><span id="wifiSignalBars" class="signal-bars"></span><em id="wifiHint">--</em></article>
+    <article id="bleCard"><small>BLE-sensor</small><b id="bleRssi">-- dBm</b><span id="bleSignalBars" class="signal-bars"></span><em id="bleHint">--</em></article>
+    <article id="packetCard"><small>ESP</small><b id="packetAge">--</b><em id="packetHint">--</em></article>
+    <article id="waterCard"><small>Vattenstatus</small><b id="healthScore">Väntar</b><em id="healthText">Ingen status ännu</em></article>
+  </section>
+
+  <section class="metric-grid">
+    <article id="tempCard" class="metric"><div class="metric-head"><span class="status-dot" id="tempDot"></span><span>Temperatur</span></div><strong id="temp">-- °C</strong><small><span id="tempHint">Pool/spa</span> <b id="tempTrend">→</b></small></article>
+    <article id="phCard" class="metric"><div class="metric-head"><span class="status-dot" id="phDot"></span><span>pH</span></div><strong id="ph">--</strong><small><span id="phHint">Rek. 7.0–7.8</span> <b id="phTrend">→</b></small><small id="phInfo" class="metric-note">Kontroll med sticka vid avvikelse</small></article>
+    <article id="clCard" class="metric"><div class="metric-head"><span class="status-dot" id="clDot"></span><span>Klor</span></div><strong id="cl">-- mg/L</strong><small><span id="clHint">OK 1.0–3.0 mg/L</span> <b id="clTrend">→</b></small></article>
+    <article id="orpCard" class="metric"><div class="metric-head"><span class="status-dot" id="orpDot"></span><span>ORP</span></div><strong id="orp">-- mV</strong><small><span id="orpHint">OK 650–800 mV</span> <b id="orpTrend">→</b></small></article>
+    <article id="batteryCard" class="metric compact"><div class="metric-head"><span class="status-dot" id="batteryDot"></span><span>Batteri</span></div><strong id="battery">-- %</strong><small><span id="batteryHint">BLE-YC01</span></small></article>
+  </section>
+
+  <section class="logbar">
+    <div class="time-direction" id="timeDirection"><span>← Nyaste data</span><strong></strong><span>Äldre data →</span></div>
+    <div><small>Loggvy</small><span id="historyInfo">Visar senaste dygnet</span></div>
+    <div class="range-tabs"><button class="range-btn active" data-range="day">Dag</button><button class="range-btn" data-range="week">Vecka</button><button class="range-btn" data-range="month">Månad</button></div>
+  </section>
+
+  <section class="summary-line">
+    <span><i class="dot-green"></i> OK</span><span><i class="dot-blue"></i> lågt</span><span><i class="dot-orange"></i> högt</span><span><i class="dot-red"></i> kritiskt</span>
+  </section>
+
+  <section class="stability-panel">
+    <div class="stability-head">
+      <small>Stabilitet / variation</small>
+      <strong id="stabilityVerdict">Beräknar...</strong>
+    </div>
+    <div class="stability-grid">
+      <span><b>pH</b><em id="phSpread">--</em></span>
+      <span><b>Klor</b><em id="clSpread">--</em></span>
+      <span><b>ORP</b><em id="orpSpread">--</em></span>
+    </div>
+  </section>
+
+  <section class="charts">
+    <article class="chart-card"><div class="chart-title"><h3>Temperatur</h3><div class="temp-scale"><i></i><span>Kallt</span><span>30–38°C</span><span>Varmt</span></div></div><canvas id="tempChart"></canvas></article>
+    <article class="chart-card"><h3>pH</h3><canvas id="phChart"></canvas></article>
+    <article class="chart-card"><h3>Klor</h3><canvas id="clChart"></canvas></article>
+    <article class="chart-card"><h3>ORP</h3><canvas id="orpChart"></canvas></article>
+  </section>
+
+  <details class="raw-card">
+    <summary>Senaste rådata / RAW HEX</summary>
+    <pre id="rawHex">--</pre>
+  </details>
+  <span id="modeText" hidden></span>
+</main>
+<script src="app.js?v=20260518-polish-v22"></script>
+</body>
+</html>
