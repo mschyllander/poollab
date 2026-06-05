@@ -1,4 +1,4 @@
-const FRONTEND_VERSION="web-1.1.56-polish-v22";
+const FRONTEND_VERSION="web-1.1.43-centered-charts";
 let tempChart=null,phChart=null,clChart=null,orpChart=null;
 const BACKEND_API="/api";
 let currentRange="day";
@@ -126,7 +126,16 @@ function rssi(r){if(r==null||Number.isNaN(Number(r))||Number(r)<=-999)return{lev
 function setSig(p,r,overrideText=null,overrideCls=null){const q=rssi(r);txt(`${p}Rssi`,r==null||Number(r)<=-999?"-- dBm":`${r} dBm`);const h=document.getElementById(`${p}Hint`);if(h){h.textContent=overrideText||q.text;h.className=overrideCls||q.cls}const b=document.getElementById(`${p}SignalBars`);if(b){b.className=`signal-bars level-${q.level} ${overrideCls||q.cls}`;b.innerHTML="<i></i><i></i><i></i><i></i>"}}
 function clsRange(v,l,lo="lågt",hi="högt"){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:50};v=Number(v);if(v>=l.okLow&&v<=l.okHigh)return{state:"ok",text:"OK",score:100};if(v<l.critLow)return{state:"critical",text:`akut ${lo}`,score:20};if(v>l.critHigh)return{state:"critical",text:`akut ${hi}`,score:20};return v<l.okLow?{state:"low",text:lo,score:65}:{state:"high",text:hi,score:65}}
 function clsTemp(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:50,cls:""};v=Number(v);if(v<15)return{state:"low",text:"Kallt",score:70,cls:"temp-cold"};if(v<30)return{state:"ok",text:"Normal pool",score:100,cls:"temp-normal"};if(v<=38)return{state:"ok",text:"Varmt pool/spa",score:100,cls:"temp-normal"};if(v<=40)return{state:"high",text:"Varmt",score:75,cls:"temp-warm"};return{state:"critical",text:"För varmt",score:35,cls:"temp-hot"}}
-function clsBat(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:60};v=Number(v);if(v>=70)return{state:"ok",text:"Bra",score:100};if(v>=50)return{state:"high",text:"Kontrollera",score:70};if(v>=30)return{state:"high",text:"Batteri lågt",score:45};return{state:"critical",text:"Byt/ladda batteri",score:20}}
+function liionHintFromPct(v){
+  if(v==null||Number.isNaN(Number(v)))return "saknar data";
+  v=Number(v);
+  if(v>=85)return "nästan fullt";
+  if(v>=65)return "bra nivå";
+  if(v>=40)return "okej nivå";
+  if(v>=25)return "planera laddning";
+  return "ladda snart";
+}
+function clsBat(v){if(v==null||Number.isNaN(Number(v)))return{state:"unknown",text:"saknar data",score:60};v=Number(v);if(v>=65)return{state:"ok",text:liionHintFromPct(v),score:100};if(v>=40)return{state:"high",text:liionHintFromPct(v),score:70};if(v>=25)return{state:"high",text:liionHintFromPct(v),score:45};return{state:"critical",text:liionHintFromPct(v),score:20}}
 function dot(id,s){const e=document.getElementById(id);if(e)e.className=`status-dot ${s}`}
 function setTemp(v,r){const e=document.getElementById("tempCard");if(e){e.classList.remove("temp-cold","temp-normal","temp-warm","temp-hot");if(r.cls)e.classList.add(r.cls)}dot("tempDot",r.state);txt("tempHint",r.text)}
 function setM(dotId,hintId,r){dot(dotId,r.state);txt(hintId,r.text)}
@@ -452,6 +461,33 @@ function bounds(values,fallbackMin,fallbackMax,pad=.10){
   const extra=(max-min)*pad;
   return{min:min-extra,max:max+extra};
 }
+
+function centeredBounds(values,fallbackMin,fallbackMax,{minSpan=1,pad=.18,hardMin=null,hardMax=null}={}){
+  const v=validNums(values,hardMin,hardMax);
+  if(!v.length)return{min:fallbackMin,max:fallbackMax};
+
+  const dataMin=Math.min(...v);
+  const dataMax=Math.max(...v);
+  const center=(dataMin+dataMax)/2;
+  const dataSpan=Math.max(dataMax-dataMin,minSpan);
+  const span=dataSpan*(1+pad);
+
+  let min=center-span/2;
+  let max=center+span/2;
+
+  if(hardMin!==null && min<hardMin){
+    max += hardMin-min;
+    min = hardMin;
+  }
+  if(hardMax!==null && max>hardMax){
+    min -= max-hardMax;
+    max = hardMax;
+  }
+  if(hardMin!==null)min=Math.max(min,hardMin);
+  if(hardMax!==null)max=Math.min(max,hardMax);
+
+  return{min,max};
+}
 function data(label,d,color,extra={}){
   return Object.assign({
     label,
@@ -527,11 +563,12 @@ function drawCharts(labels,temp,ph,cl,orp){
     const latestTemp=[...tempData].reverse().find(v=>Number.isFinite(Number(v)));
     const liveT=Number(latestTemp||20);
 
-    // Stable axes with enough room, but not oversized.
+    // Data-centered axes: the measured spread gets equal visual room above and below.
+    // This avoids lines being glued to the top/bottom of the chart.
     const tb=fixedAxisFor("temp");
-    const pb={min:6.7,max:8.1};
-    const cb=fixedAxisFor("cl");
-    const ob=fixedAxisFor("orp");
+    const pb=centeredBounds(phData,6.7,8.1,{minSpan:.60,pad:.18,hardMin:0,hardMax:14});
+    const cb=centeredBounds(clData,0,2.5,{minSpan:1.20,pad:.18,hardMin:0,hardMax:10});
+    const ob=centeredBounds(orpData,500,850,{minSpan:180,pad:.18,hardMin:300,hardMax:1000});
 
     tempChart=makeChart(tempCanvas,{
       type:"line",
