@@ -52,7 +52,7 @@ const char* HEARTBEAT_URL = "http://192.168.1.184:8010/api/pool/heartbeat";
 const char* DEVICE_ID = "pool-esp32-01";
 const char* SETUP_AP_SSID = "pool-setup";
 const char* SETUP_AP_PASS = "12345678";
-const char* FIRMWARE_VERSION = "1.1.42";
+const char* FIRMWARE_VERSION = "1.1.43";
 
 const int TEMP_PAIR_INDEX = 13;
 const int PH_PAIR_INDEX = 3;  // BLE raw pH pair.
