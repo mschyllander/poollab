@@ -52,7 +52,7 @@ const char* HEARTBEAT_URL = "http://192.168.1.184:8010/api/pool/heartbeat";
 const char* DEVICE_ID = "pool-esp32-01";
 const char* SETUP_AP_SSID = "pool-setup";
 const char* SETUP_AP_PASS = "12345678";
-const char* FIRMWARE_VERSION = "1.1.43";
+const char* FIRMWARE_VERSION = "1.1.44";
 
 const int TEMP_PAIR_INDEX = 13;
 const int PH_PAIR_INDEX = 3;  // BLE raw pH pair.
@@ -62,6 +62,7 @@ const char* HTTP_OTA_URL = "http://192.168.1.184:8010/update/poolsniffer.bin";
 const unsigned long HEARTBEAT_INTERVAL_MS = 30000;
 const unsigned long SENSOR_TRIGGER_INTERVAL_MS = 30UL * 60UL * 1000UL;
 const unsigned long BATTERY_SCAN_INTERVAL_MS = 30UL * 60UL * 1000UL;
+const unsigned long BLE_RECONNECT_INTERVAL_MS = 2UL * 60UL * 1000UL;
 const uint32_t BATTERY_SCAN_SECONDS = 3;
 
 const float TEMP_OFFSET_C = 0.0f;
@@ -120,10 +121,12 @@ const int ORP_SPIKE_CONFIRM_COUNT = 3;
 
 float lastStableCl = NAN;
 const float CL_EMA_ALPHA = 0.35f;            // 0.35 = responsive but smoother than raw spikes
+const float CL_RAW_MAX_VALID_MG_L = 20.0f;
 
 unsigned long lastTrigger = 0;
 unsigned long lastBatteryScan = 0;
 unsigned long lastHeartbeat = 0;
+unsigned long lastBleReconnectAttempt = 0;
 String currentBleStatus = "booting";
 
 // ===================== FORWARD DECLARATIONS =====================
@@ -147,6 +150,11 @@ void setBleStatus(const String& status) {
 
 String boolJson(bool v) {
   return v ? "true" : "false";
+}
+
+String floatJson(float value, int decimals, bool valid = true) {
+  if (!valid || isnan(value) || isinf(value)) return "null";
+  return String(value, decimals);
 }
 
 void serviceTasks() {
@@ -560,13 +568,19 @@ float filterORP(float newOrp) {
 }
 
 float filterChlorine(float newCl) {
-  if (newCl < 0.0f || newCl > 20.0f || isnan(newCl)) return isnan(lastStableCl) ? 0.0f : lastStableCl;
+  if (newCl < 0.0f || newCl > CL_RAW_MAX_VALID_MG_L || isnan(newCl)) return lastStableCl;
   if (isnan(lastStableCl)) {
     lastStableCl = newCl;
   } else {
     lastStableCl = (CL_EMA_ALPHA * newCl) + ((1.0f - CL_EMA_ALPHA) * lastStableCl);
   }
   return lastStableCl;
+}
+
+bool isValidRawChlorine(uint16_t rawValue, float rawCl) {
+  if (rawValue == 0xFFFF || rawValue == 0xFFFE) return false;
+  if (isnan(rawCl) || isinf(rawCl)) return false;
+  return rawCl >= 0.0f && rawCl <= CL_RAW_MAX_VALID_MG_L;
 }
 
 static constexpr float CHLORINE_FACTOR = 2.25f;
@@ -668,7 +682,7 @@ void sendHeartbeat(const String& status, bool force) {
   serviceTasks();
 }
 
-void postMeasurement(float tempC, float ph, float orp, float cl, float battery, float rawTempC, float rawPhBle, float rawOrp, float rawCl, const String& rawHex) {
+void postMeasurement(float tempC, float ph, float orp, float cl, float battery, float rawTempC, float rawPhBle, float rawOrp, float rawCl, float clEst, bool chlorineValid, const String& chlorineStatus, const String& rawHex) {
   if (WiFi.status() != WL_CONNECTED || otaMaintenanceMode) return;
   serviceTasks();
 
@@ -683,11 +697,14 @@ void postMeasurement(float tempC, float ph, float orp, float cl, float battery, 
   json += "\"temp_c\":" + String(tempC, 2) + ",";
   json += "\"ph\":" + String(ph, 2) + ",";
   json += "\"orp_mv\":" + String(orp, 0) + ",";
-  json += "\"cl_mg_l\":" + String(cl, 2) + ",";
+  json += "\"cl_mg_l\":" + floatJson(cl, 2, chlorineValid) + ",";
   json += "\"raw_temp_c\":" + String(rawTempC, 2) + ",";
   json += "\"raw_ph\":" + String(rawPhBle, 2) + ",";
   json += "\"raw_orp_mv\":" + String(rawOrp, 0) + ",";
   json += "\"raw_cl_mg_l\":" + String(rawCl, 2) + ",";
+  json += "\"cl_est_mg_l\":" + floatJson(clEst, 2, true) + ",";
+  json += "\"chlorine_valid\":" + boolJson(chlorineValid) + ",";
+  json += "\"chlorine_status\":\"" + chlorineStatus + "\",";
   json += "\"battery_pct\":" + String(battery >= 0.0f ? String(battery, 1) : "null") + ",";
   json += "\"battery_chemistry\":\"liion_1s\",";
   json += "\"battery_source\":\"ble_yc01_advertisement_or_decoded_frame\",";
@@ -839,7 +856,9 @@ void printFrame(const std::string& value, const char* source) {
   float orp = filterORP(rawOrp);
   float decodedClRaw = clU / 10.0f;
   float clEst = estimateChlorine(orp, ph);
-  float cl = filterChlorine(decodedClRaw);
+  bool chlorineValid = isValidRawChlorine(clU, decodedClRaw);
+  String chlorineStatus = chlorineValid ? "raw_sensor_value" : "invalid_raw_sensor_value";
+  float cl = chlorineValid ? filterChlorine(decodedClRaw) : NAN;
 
   float decodedBattery = battU / 31.9f;
   if (decodedBattery >= 0.0f && decodedBattery <= 100.0f) batteryPct = decodedBattery;
@@ -867,14 +886,16 @@ void printFrame(const std::string& value, const char* source) {
   if (fabs(rawPh - ph) > 0.01f) Serial.printf(" rawPHdisplay=%.2f rawPHble=%.2f", rawPh, rawPhBle);
   Serial.printf(" | ORP≈%.0fmV", orp);
   if (fabs(rawOrp - orp) > 0.5f) Serial.printf(" rawORP=%.0fmV", rawOrp);
-  Serial.printf(" | CL≈%.2fmg/L rawCL=%.2fmg/L | CL_est≈%.2fmg/L | EC=%u | TDS=%u", cl, decodedClRaw, clEst, ecU, tdsU);
+  if (chlorineValid) Serial.printf(" | CL≈%.2fmg/L rawCL=%.2fmg/L", cl, decodedClRaw);
+  else Serial.printf(" | CL invalid rawCL=%.2fmg/L", decodedClRaw);
+  Serial.printf(" | CL_est≈%.2fmg/L | EC=%u | TDS=%u", clEst, ecU, tdsU);
   if (batteryPct >= 0.0f) Serial.printf(" | Battery≈%.1f%%", batteryPct); else Serial.print(" | Battery=N/A");
   if (WiFi.status() == WL_CONNECTED) Serial.printf(" | WiFiRSSI=%ddBm", WiFi.RSSI()); else Serial.print(" | WiFiRSSI=N/A");
   Serial.printf(" | BLERSSI=%ddBm | FW=%s | pH candidates /100: %s | DEC=%s | RAW=%s\n", lastBleRssi, FIRMWARE_VERSION, phCandidates.c_str(), decodedHex.c_str(), rawHex.c_str());
 
   setBleStatus("ble_ok");
   sendHeartbeat(currentBleStatus, true);
-  postMeasurement(tempC, ph, orp, cl, batteryPct, rawTempC, rawPhBle, rawOrp, decodedClRaw, rawHex);
+  postMeasurement(tempC, ph, orp, cl, batteryPct, rawTempC, rawPhBle, rawOrp, decodedClRaw, clEst, chlorineValid, chlorineStatus, rawHex);
 }
 
 void notifyCallback(BLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
@@ -1131,6 +1152,13 @@ void loop() {
   serviceTasks();
 
   sendHeartbeat(currentBleStatus, false);
+
+  bool bleConnected = pClient != nullptr && pClient->isConnected() && pChar != nullptr;
+  if (!otaMaintenanceMode && !bleConnected && millis() - lastBleReconnectAttempt > BLE_RECONNECT_INTERVAL_MS) {
+    lastBleReconnectAttempt = millis();
+    Serial.println("BLE disconnected. Scheduled reconnect...");
+    if (connectToSensor()) sendSensorTrigger();
+  }
 
   if (millis() - lastBatteryScan > BATTERY_SCAN_INTERVAL_MS) {
     lastBatteryScan = millis();

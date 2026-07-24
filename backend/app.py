@@ -10,7 +10,7 @@ from fastapi import Body, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-APP_VERSION = "pool-backend-1.1.34-smoothed-raw-ready"
+APP_VERSION = "pool-backend-1.1.50-chlorine-diagnostics"
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DB_FILE = Path(os.getenv("DB_FILE", str(DATA_DIR / "pool_logger.db")))
@@ -97,6 +97,9 @@ def init_db() -> None:
                 raw_ph REAL,
                 raw_orp_mv REAL,
                 raw_cl_mg_l REAL,
+                cl_est_mg_l REAL,
+                chlorine_valid INTEGER,
+                chlorine_status TEXT,
                 filter_status TEXT,
                 battery_pct REAL,
                 wifi_rssi_dbm INTEGER,
@@ -116,6 +119,9 @@ def init_db() -> None:
         add_column_if_missing(conn, "pool_measurements", "raw_ph", "REAL")
         add_column_if_missing(conn, "pool_measurements", "raw_orp_mv", "REAL")
         add_column_if_missing(conn, "pool_measurements", "raw_cl_mg_l", "REAL")
+        add_column_if_missing(conn, "pool_measurements", "cl_est_mg_l", "REAL")
+        add_column_if_missing(conn, "pool_measurements", "chlorine_valid", "INTEGER")
+        add_column_if_missing(conn, "pool_measurements", "chlorine_status", "TEXT")
         add_column_if_missing(conn, "pool_measurements", "filter_status", "TEXT")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pool_measurements_ts ON pool_measurements(ts_unix)")
@@ -142,6 +148,9 @@ class PoolMeasurementIn(BaseModel):
     raw_ph: Optional[float] = None
     raw_orp_mv: Optional[float] = None
     raw_cl_mg_l: Optional[float] = None
+    cl_est_mg_l: Optional[float] = None
+    chlorine_valid: Optional[bool] = None
+    chlorine_status: Optional[str] = None
     filter_status: Optional[str] = Field(default="smoothed")
 
     battery_pct: Optional[float] = None
@@ -238,10 +247,11 @@ def create_measurement(payload: PoolMeasurementIn = Body(...)) -> dict[str, Any]
             """
             INSERT INTO pool_measurements (
                 device_id, ts_unix, uptime_ms, temp_c, ph, orp_mv, cl_mg_l,
-                raw_temp_c, raw_ph, raw_orp_mv, raw_cl_mg_l, filter_status,
+                raw_temp_c, raw_ph, raw_orp_mv, raw_cl_mg_l,
+                cl_est_mg_l, chlorine_valid, chlorine_status, filter_status,
                 battery_pct, wifi_rssi_dbm, ble_rssi_dbm, firmware_version,
                 ble_sensor_mac, raw_hex
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.device_id,
@@ -255,6 +265,9 @@ def create_measurement(payload: PoolMeasurementIn = Body(...)) -> dict[str, Any]
                 payload.raw_ph,
                 payload.raw_orp_mv,
                 payload.raw_cl_mg_l,
+                payload.cl_est_mg_l,
+                None if payload.chlorine_valid is None else int(payload.chlorine_valid),
+                payload.chlorine_status,
                 payload.filter_status or "smoothed",
                 payload.battery_pct,
                 payload.wifi_rssi_dbm,

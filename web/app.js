@@ -66,7 +66,13 @@ function ensureClInfo(){let e=document.getElementById("clInfo");if(e)return e;co
 function setClInfo(latest,history){
   const e=ensureClInfo();if(!e)return;
   const v=Number(latest?.cl_mg_l);
-  if(!Number.isFinite(v)){e.textContent="Rek. 1.0–3.0 mg/L";return}
+  const est=Number(latest?.cl_est_mg_l);
+  const status=String(latest?.chlorine_status||"");
+  if(latest?.chlorine_valid===false||status.includes("invalid")){
+    e.textContent=Number.isFinite(est)?`Råklor ogiltigt · ORP-estimat ${est.toFixed(2)} mg/L`:"Råklor ogiltigt";
+    return;
+  }
+  if(!Number.isFinite(v)){e.textContent="Klor saknar giltig data";return}
   if(v<1.0)e.textContent="Öka klorhalt";
   else if(v>3.0)e.textContent="Sänk/avvakta klor";
   else e.textContent="Rek. 1.0–3.0 mg/L";
@@ -272,7 +278,8 @@ async function loadData(){startLoadingAnimation("Laddar");try{const [latest,hr,s
     const wifiRssi=firstSigned(hb?.wifi_rssi_dbm,latest?.wifi_rssi_dbm,sl?.wifi_rssi_dbm,last?.wifi_rssi_dbm);
     const bleRssi=firstSigned(hb?.ble_rssi_dbm,latest?.ble_rssi_dbm,sl?.ble_rssi_dbm,last?.ble_rssi_dbm);
     const bat=first(hb?.battery_pct,latest?.battery_pct,sl?.battery_pct,last?.battery_pct);
-    txt("temp",`${n(latest.temp_c,1)} °C`);txt("ph",n(latest.ph,2));txt("orp",`${n(latest.orp_mv,0)} mV`);txt("cl",`${n(latest.cl_mg_l,2)} mg/L`);txt("battery",bat==null?"-- %":`${bat.toFixed(1)} %`);txt("rawHex",latest.raw_hex||"--");setClInfo(latest,all);setStabilitySummary(all);
+    const clValid=latest?.chlorine_valid!==false&&!String(latest?.chlorine_status||"").includes("invalid");
+    txt("temp",`${n(latest.temp_c,1)} °C`);txt("ph",n(latest.ph,2));txt("orp",`${n(latest.orp_mv,0)} mV`);txt("cl",clValid?`${n(latest.cl_mg_l,2)} mg/L`:"-- mg/L");txt("battery",bat==null?"-- %":`${bat.toFixed(1)} %`);txt("rawHex",latest.raw_hex||"--");setClInfo(latest,all);setStabilitySummary(all);
 
     setSig("wifi",wifiRssi,espOnline?null:"ingen heartbeat",espOnline?null:"bad");
     setSig("ble",bleRssi,bleConnected?"ansluten":bleStatusText(hb?.ble_status),bleConnected?"good":"warn");
