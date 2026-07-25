@@ -52,7 +52,7 @@ const char* HEARTBEAT_URL = "http://192.168.1.184:8010/api/pool/heartbeat";
 const char* DEVICE_ID = "pool-esp32-01";
 const char* SETUP_AP_SSID = "pool-setup";
 const char* SETUP_AP_PASS = "12345678";
-const char* FIRMWARE_VERSION = "1.1.44";
+const char* FIRMWARE_VERSION = "1.1.45";
 
 const int TEMP_PAIR_INDEX = 13;
 const int PH_PAIR_INDEX = 3;  // BLE raw pH pair.
@@ -100,6 +100,8 @@ bool haveLastDecodedFrame = false;
 
 bool otaMaintenanceMode = false;
 unsigned long otaMaintenanceUntil = 0;
+int consecutiveBleConnectFailures = 0;
+int consecutiveAdvertisementMisses = 0;
 
 float lastStableTemp = NAN;
 float pendingTemp = NAN;
@@ -141,6 +143,8 @@ void printFrame(const std::string& value, const char* source);
 void sendSensorTrigger();
 String statusJson();
 uint16_t u16RawBE(const uint8_t* d, int i);
+void restartBleStack(const char* reason);
+void dumpAdvertisements(uint32_t seconds = 8);
 
 // ===================== SERVICE / OTA HELPERS =====================
 
@@ -203,6 +207,42 @@ void ensureBleInitialized() {
     bleInitialized = true;
     Serial.println("BLE initialized.");
   }
+}
+
+void restartBleStack(const char* reason) {
+  Serial.print("Restarting BLE stack: ");
+  Serial.println(reason);
+  pChar = nullptr;
+
+  if (pClient != nullptr) {
+    if (pClient->isConnected()) {
+      pClient->disconnect();
+      delay(300);
+    }
+    delete pClient;
+    pClient = nullptr;
+  }
+
+  if (pBLEScan != nullptr) {
+    pBLEScan->clearResults();
+    pBLEScan = nullptr;
+  }
+
+  if (bleInitialized) {
+    BLEDevice::deinit(true);
+    bleInitialized = false;
+    delay(500);
+  }
+
+  btStop();
+  delay(500);
+  btStart();
+  delay(500);
+  consecutiveBleConnectFailures = 0;
+  consecutiveAdvertisementMisses = 0;
+  setBleStatus("ble_stack_restarted");
+  sendHeartbeat(currentBleStatus, true);
+  ensureBleInitialized();
 }
 
 // ===================== EEPROM HELPERS =====================
@@ -725,6 +765,42 @@ void postMeasurement(float tempC, float ph, float orp, float cl, float battery, 
 
 // ===================== BLE =====================
 
+void dumpAdvertisements(uint32_t seconds) {
+  if (otaMaintenanceMode) { Serial.println("SCAN skipped: OTA maintenance active."); return; }
+  ensureBleInitialized();
+  serviceTasks();
+
+  Serial.printf("BLE advertisement scan for %u seconds...\n", seconds);
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  BLEScanResults results = scan->start(seconds, false);
+  Serial.printf("BLE advertisements seen: %d\n", results.getCount());
+
+  for (int i = 0; i < results.getCount(); i++) {
+    serviceTasks();
+    BLEAdvertisedDevice dev = results.getDevice(i);
+    String name = dev.haveName() ? dev.getName().c_str() : "";
+    String mac = dev.getAddress().toString().c_str();
+    mac.toLowerCase();
+    std::string mfg = dev.getManufacturerData();
+    Serial.printf(
+      "ADV %02d | rssi=%d | mac=%s | name=%s | mfg_len=%d",
+      i,
+      dev.getRSSI(),
+      mac.c_str(),
+      name.c_str(),
+      (int)mfg.length()
+    );
+    if (mac == pairedSensorMac) Serial.print("  <-- paired MAC");
+    if (name == "BLE-YC01") Serial.print("  <-- BLE-YC01 name");
+    if (mac.startsWith("c0:00:00:")) Serial.print("  <-- YC01-like MAC");
+    Serial.println();
+  }
+
+  scan->clearResults();
+  serviceTasks();
+}
+
 void scanBattery() {
   if (otaMaintenanceMode) { Serial.println("Skipping battery scan: OTA maintenance active."); return; }
   ensureBleInitialized();
@@ -746,6 +822,7 @@ void scanBattery() {
     String mac = dev.getAddress().toString().c_str(); mac.toLowerCase();
     if (mac != targetMac) continue;
     found = true;
+    consecutiveAdvertisementMisses = 0;
     setBleStatus("ble_advertisement_seen");
     lastBleRssi = dev.getRSSI();
     Serial.println("Found target BLE-YC01 by MAC.");
@@ -765,8 +842,10 @@ void scanBattery() {
 
   if (!found) {
     Serial.println("Target BLE device not found during battery scan.");
+    consecutiveAdvertisementMisses++;
     setBleStatus("ble_advertisement_not_found");
     sendHeartbeat(currentBleStatus, true);
+    if (consecutiveAdvertisementMisses >= 2) restartBleStack("repeated advertisement misses");
   }
 
   pBLEScan->clearResults();
@@ -923,12 +1002,15 @@ bool connectToSensor() {
   if (!pClient->connect(sensorAddress)) {
     Serial.println("Connect failed.");
     pChar = nullptr;
+    consecutiveBleConnectFailures++;
     setBleStatus("ble_connect_failed");
     sendHeartbeat(currentBleStatus, true);
+    if (consecutiveBleConnectFailures >= 3) restartBleStack("repeated connect failures");
     return false;
   }
 
   Serial.println("Connected.");
+  consecutiveBleConnectFailures = 0;
   setBleStatus("ble_connected");
   sendHeartbeat(currentBleStatus, true);
 
@@ -1073,6 +1155,8 @@ void handleNamedCommand(String cmd) {
   if (cmd == "PAIRS") { if (haveLastDecodedFrame) dumpDecodedYC01Pairs(lastDecodedFrame, lastDecodedLen); else Serial.println("No decoded frame yet. Wait for READ/NOTIFY first."); return; }
   if (cmd == "READ") { if (pChar && pChar->canRead()) { std::string value = pChar->readValue(); printFrame(value, "READ"); } else Serial.println("Cannot READ: pChar missing or not readable."); return; }
   if (cmd == "BAT") { if (pClient && pClient->isConnected()) { pChar = nullptr; pClient->disconnect(); delay(300); } scanBattery(); connectToSensor(); return; }
+  if (cmd == "SCAN" || cmd == "ADV") { dumpAdvertisements(8); return; }
+  if (cmd == "BLERESET") { restartBleStack("manual command"); return; }
   if (cmd == "PAIR") { if (pClient && pClient->isConnected()) { pChar = nullptr; pClient->disconnect(); delay(300); } if (pairBleSensor()) { Serial.println("PAIR done. Reconnecting..."); connectToSensor(); } return; }
   if (cmd == "CLEARPAIR") { clearBlePairing(); Serial.println("BLE pairing cleared. Rebooting..."); delay(1000); ESP.restart(); }
   if (cmd == "CLEARWIFI") { clearWiFiConfig(); Serial.println("WiFi config cleared. Rebooting..."); delay(1000); ESP.restart(); }
@@ -1081,7 +1165,7 @@ void handleNamedCommand(String cmd) {
   if (cmd == "STATUS") { printStatus(); return; }
   if (cmd == "REBOOT") { Serial.println("Rebooting..."); delay(500); ESP.restart(); }
   if (cmd == "HELP") {
-    Serial.println("Commands: READ, PAIRS, BAT, STATUS, HEARTBEAT, HTTPOTA, PAIR, CLEARPAIR, DUMP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
+    Serial.println("Commands: READ, PAIRS, BAT, SCAN, BLERESET, STATUS, HEARTBEAT, HTTPOTA, PAIR, CLEARPAIR, DUMP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
     return;
   }
   uint8_t raw[32]; size_t len = 0;
@@ -1143,7 +1227,7 @@ void setup() {
   }
 
   Serial.println("Pool logger ready.");
-  Serial.println("Commands: READ, PAIRS, BAT, PAIR, CLEARPAIR, STATUS, HEARTBEAT, HTTPOTA, DUMP, HELP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
+  Serial.println("Commands: READ, PAIRS, BAT, SCAN, BLERESET, PAIR, CLEARPAIR, STATUS, HEARTBEAT, HTTPOTA, DUMP, HELP, CLEARWIFI, REBOOT, or raw hex like 55 AA");
 }
 
 void loop() {
